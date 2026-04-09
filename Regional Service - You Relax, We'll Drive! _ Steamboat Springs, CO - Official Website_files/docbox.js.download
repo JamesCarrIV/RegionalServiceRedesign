@@ -1,0 +1,3516 @@
+// DocBox - The DocAccess Document Inventory Script
+// The script will submit new document links to DocAccess to create an inventory
+// For DocAccess-remediated documents that are enabled by the site administrator, 
+// script will open in the DocAccess viewer to facilitate compliance with WCAG 2.1 AA standards
+// Last major update: 2025-10-31
+// Usage of this script is subject to the DocAccess Terms of Service
+// https://docaccess.com/terms-of-service/ and
+// https://docaccess.com/terms-of-use
+
+// Create DocAccess namespace to avoid global variable conflicts
+window.DocAccess = window.DocAccess || {};
+
+// Silently handle duplicate loads
+
+// Check for configuration to disable or modify behavior
+// Configuration options:
+//   disabled: true - Completely disable DocBox
+//   disableExternalAPIs: true - Don't send discovered PDF links to API (privacy)
+//   batchSize: 10 - Number of links to process per batch (default: 10)
+//   processingDelay: 0 - Milliseconds to wait between batches (default: 0)
+//   lazyLoad: true - Only process links when they become visible (requires IntersectionObserver)
+if (!window.DocAccess.config) {
+    window.DocAccess.config = window.DocAccessConfig || {};
+}
+
+// API Endpoint Configuration
+// Set to false to use the new API endpoint (docaccess.com/api/doc-link)
+// Set to true to use the legacy API endpoint (admin.docaccess.com/api/v1/domain_link)
+if (window.DocAccess.USE_LEGACY_API === undefined) {
+    window.DocAccess.USE_LEGACY_API = false;
+}
+
+// Detect the origin where docbox.js was loaded from (for API calls)
+if (!window.DocAccess.scriptOrigin) {
+    (function () {
+        let scriptSrc = null;
+        if (document.currentScript && document.currentScript.src) {
+            scriptSrc = document.currentScript.src;
+        } else {
+            // Fallback: search all script tags for one ending with docbox.js
+            const scripts = document.getElementsByTagName('script');
+            for (let i = 0; i < scripts.length; i++) {
+                if (scripts[i].src && scripts[i].src.match(/docbox\.js(\?.*)?$/)) {
+                    scriptSrc = scripts[i].src;
+                    break;
+                }
+            }
+        }
+        if (scriptSrc) {
+            try {
+                const url = new URL(scriptSrc);
+                window.DocAccess.scriptOrigin = url.origin;
+            } catch (e) {
+                window.DocAccess.scriptOrigin = 'https://docaccess.com';
+            }
+        } else {
+            window.DocAccess.scriptOrigin = 'https://docaccess.com';
+        }
+    })();
+}
+
+// Initialize internal variables within namespace (only if not already set)
+// This prevents resetting values when script is loaded multiple times
+if (!window.DocAccess.domainDocumentLinkData) {
+    window.DocAccess.domainDocumentLinkData = {}; // Initialize as object, not array
+}
+if (!window.DocAccess.primaryDomain) {
+    window.DocAccess.primaryDomain = null;
+}
+if (!window.DocAccess.domainAliases) {
+    window.DocAccess.domainAliases = [];
+}
+if (window.DocAccess.onDocAccessDomain === undefined) {
+    window.DocAccess.onDocAccessDomain = false;
+}
+if (window.DocAccess.domainDataLoaded === undefined) {
+    window.DocAccess.domainDataLoaded = false;
+}
+
+// Performance optimization: caches for expensive operations
+if (!window.DocAccess.sha256Cache) {
+    window.DocAccess.sha256Cache = new Map();
+}
+if (!window.DocAccess.normalizationCache) {
+    window.DocAccess.normalizationCache = new Map();
+}
+// Track processed links internally (doesn't add any DOM attributes)
+// WeakMap stores the href used for processing so we can detect when a page's
+// client-side JS changes a link's href after we already processed it.
+if (!window.DocAccess.processedLinks) {
+    window.DocAccess.processedLinks = new WeakMap();
+}
+
+// Batch processing guard to prevent multiple simultaneous batches
+if (window.DocAccess.isBatchProcessing === undefined) {
+    window.DocAccess.isBatchProcessing = false;
+}
+
+// Silent log buffer -- stores diagnostic messages without cluttering the console.
+// Inspect via: DocAccess.log    (array of {t, msg, args} entries)
+if (!window.DocAccess.log) {
+    window.DocAccess.log = [];
+    window.DocAccess._log = function (msg, ...args) {
+        window.DocAccess.log.push({ t: Date.now(), msg, args });
+        if (window.DocAccess.log.length > 500) window.DocAccess.log.shift();
+    };
+}
+
+// Initialize currentDomain within namespace to avoid conflicts
+// Always use the hostname - don't check for global currentDomain to avoid conflicts
+if (!window.DocAccess.currentDomain) {
+    window.DocAccess.currentDomain = window.location.hostname.replace(/^www\./, '').toLowerCase();
+}
+
+// Initialize default excluded paths (always applied)
+if (!window.DocAccess.defaultExcludedPaths) {
+    window.DocAccess.defaultExcludedPaths = [
+        '/admin/*',
+        'reciteme.com/doc/url*'
+    ];
+}
+if (!window.DocAccess.excludedPaths) {
+    window.DocAccess.excludedPaths = [...window.DocAccess.defaultExcludedPaths];
+}
+
+// Track current lightbox state for history management
+if (window.DocAccess.currentLightboxState === undefined) {
+    window.DocAccess.currentLightboxState = null;
+}
+if (window.DocAccess.isHandlingHashChange === undefined) {
+    window.DocAccess.isHandlingHashChange = false;
+}
+if (window.DocAccess.lastActivatedLink === undefined) {
+    window.DocAccess.lastActivatedLink = null; // Track the link that opened the lightbox
+}
+
+// Common file patterns for PDF links
+window.DocAccess.commonFilePatterns = `
+    a[href*=".pdf" i], 
+    a[href*="/api/assets/"],
+    a[href*="DocumentCenter/View/" i], 
+    a[href*="/ViewFile/"], 
+    a[href*="/showpublisheddocument/"],
+    a[href*="/media/"],
+    a[href^="media/"],
+    a[href*="/ld.php?content_id="],
+    a[href*="/assets/"][href*="/file"],
+    a[href*="/assets/pdf/"],
+    a[href*="/home/showdocument?id="],
+    a[href^="Archive.aspx?ADID="],
+    a[href*="/DocumentView.aspx?DID="],
+    a[href^="FileStream.ashx?DocumentId="],
+    a[href*="/common/pages/GetFile.ashx"],
+    a[href*="/file/getfile/"],
+    a[href*="drive.google.com/file/d/"],
+    a[href*="drive.google.com/open?id="],
+    a[href*="drive.google.com/uc?export=download"],
+    a[href*="docs.google.com/document/d/"],
+    a[href*="docs.google.com/spreadsheets/d/"],
+    a[href*="docs.google.com/presentation/d/"],
+    a[href*="5il.co/"],
+    a[href*="View.ashx?"],
+    a[href*="ViewReport.ashx?"],
+    a[href*="/files/"],
+    a[href*="/minutes"],
+    a[href*="/agenda"],
+    a[href*="/fs/resource-manager/view/"],
+    a[href*="/portal/"][href*="/open/"],
+    a[href*="/docs/"],
+    a[data-downloadurl],
+    a[href*="GetMeetingFileStream"],
+    a[href*="/document/"],
+    a[href*="/pdf_packet/get_agenda_document_link"],
+    a[href*="MetaViewer.php?view_id="],
+    a[href*="AgendaViewer.php?view_id="],
+    a[href*="legistar.com/gateway.aspx?M=F&ID="],
+    a[href*="/DocumentSearch/Home/downloaddoc"],
+    a[href$="/file"],
+    a.docbox-enable,
+    a.docbox-enable-viewer,
+    a.docbox-direct
+`;
+
+// Helper function to check if a hostname should be normalized to primary domain
+window.DocAccess.shouldNormalizeHostname = function (hostname) {
+    if (!window.DocAccess.primaryDomain) return false;
+
+    const hostLower = hostname.toLowerCase();
+    const hostWithoutWww = hostLower.replace(/^www\./, '');
+    const primaryLower = window.DocAccess.primaryDomain.toLowerCase();
+    const primaryWithoutWww = primaryLower.replace(/^www\./, '');
+
+    // Check if it's the primary domain (with or without www)
+    if (hostWithoutWww === primaryWithoutWww) {
+        return true;
+    }
+
+    // Check if it's one of the aliases
+    return window.DocAccess.domainAliases.some(alias => {
+        const aliasLower = alias.toLowerCase();
+        const aliasWithoutWww = aliasLower.replace(/^www\./, '');
+        return hostWithoutWww === aliasWithoutWww;
+    });
+}
+
+// Helper function to check if a URL matches any excluded path patterns
+window.DocAccess.isUrlExcluded = function (url) {
+    if (!window.DocAccess.excludedPaths || window.DocAccess.excludedPaths.length === 0) {
+        return false;
+    }
+
+    try {
+        const urlObj = new URL(url);
+        // Include both pathname and search (query string) for matching
+        const urlPath = urlObj.pathname + urlObj.search;
+
+        // Check if path (including query string) matches any excluded pattern
+        return window.DocAccess.excludedPaths.some(pattern => {
+            // Check if pattern includes a domain (doesn't start with /)
+            if (!pattern.startsWith('/')) {
+                // Domain-based pattern (e.g., 'reciteme.com/doc/url*')
+                // Extract hostname from URL for comparison
+                const hostname = urlObj.hostname.replace(/^www\./, '').toLowerCase();
+
+                // Convert wildcard pattern to regex
+                const regexPattern = pattern
+                    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+                    .replace(/\*/g, '.*');
+                const regex = new RegExp('^' + regexPattern + '$');
+
+                // Test against hostname + pathname + search
+                const fullPath = hostname + urlObj.pathname + urlObj.search;
+                return regex.test(fullPath);
+            } else {
+                // Path-only pattern (e.g., '/admin/*')
+                // Convert wildcard pattern to regex
+                const regexPattern = pattern
+                    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+                    .replace(/\*/g, '.*');
+                const regex = new RegExp('^' + regexPattern + '$');
+                return regex.test(urlPath);
+            }
+        });
+    } catch (e) {
+        return false;
+    }
+};
+
+// Helper function to check if a URL matches any included path patterns (regex)
+window.DocAccess.isUrlIncluded = function (url) {
+    if (!window.DocAccess.includedPaths || window.DocAccess.includedPaths.length === 0) {
+        return false;
+    }
+
+    try {
+        const urlObj = new URL(url);
+        const urlPath = urlObj.pathname;
+        const fullPath = urlObj.pathname + urlObj.search; // Include query string for matching
+
+        // Check if path matches any included pattern (these are full regex patterns)
+        return window.DocAccess.includedPaths.some(pattern => {
+            try {
+                const regex = new RegExp(pattern);
+                // Test against both the pathname and full path with query
+                return regex.test(urlPath) || regex.test(fullPath);
+            } catch (e) {
+                console.warn('DocAccess: Invalid included path regex pattern:', pattern, e);
+                return false;
+            }
+        });
+    } catch (e) {
+        return false;
+    }
+};
+
+// Helper function to clean Chrome extension wrapper URLs (e.g., Adobe Acrobat viewer)
+// The Adobe Acrobat Chrome extension wraps PDF URLs like:
+// chrome-extension://efaidnbmnnnibpcajpcglclefindmkaj/https://example.com/doc.pdf
+// We need to extract the actual PDF URL from these wrappers
+window.DocAccess.cleanChromeExtensionUrl = function (urlString) {
+    if (!urlString) return urlString;
+
+    // Pattern matches various forms of the chrome-extension URL wrapper:
+    // - http://chrome-extension//efaidnbmnnnibpcajpcglclefindmkaj/https://...
+    // - https://chrome-extension//efaidnbmnnnibpcajpcglclefindmkaj/https://...
+    // - chrome-extension://efaidnbmnnnibpcajpcglclefindmkaj/https://...
+    // - http://chrome-extension/efaidnbmnnnibpcajpcglclefindmkaj/https://...
+    // The key is the extension ID: efaidnbmnnnibpcajpcglclefindmkaj (Adobe Acrobat)
+    const chromeExtensionPattern = /^(?:https?:)?\/?\/?chrome-extension\/?\/?\/?efaidnbmnnnibpcajpcglclefindmkaj\/(https?:\/\/.+)$/i;
+    const match = urlString.match(chromeExtensionPattern);
+    if (match) {
+        return match[1]; // Return the actual URL
+    }
+    return urlString;
+};
+
+// Helper function to clean tracking parameters from URLs
+window.DocAccess.cleanTrackingParams = function (urlString) {
+    try {
+        // First, clean any Chrome extension wrapper URLs
+        urlString = window.DocAccess.cleanChromeExtensionUrl(urlString);
+
+        // Strip CivicClerk customFileName (appended to OData path, not a standard query param)
+        urlString = urlString.replace(/[?&]customFileName=[^&#]*/g, '');
+
+        // Strip Azure SAS tokens from CivicClerk blob storage URLs — each page load
+        // generates a fresh SAS token, making the same PDF appear as a unique URL
+        if (urlString.includes('civicclerk.blob.core.windows.net/')) {
+            urlString = urlString.replace(/\?.*$/, '');
+        }
+
+        // Normalize CivicClerk OData function calls to raw (unencoded) form
+        // Both documents table and browser hrefs use: GetMeetingFileStream(fileId=123,plainText=false)
+        // The old docbox-civicclerk.js code produced percent-encoded URLs, but canonical is unencoded
+        urlString = urlString.replace(
+            /GetMeetingFileStream%28(.*?)%29/gi,
+            function (match, params) {
+                return 'GetMeetingFileStream(' + decodeURIComponent(params) + ')';
+            }
+        );
+
+        const url = new URL(urlString);
+        const trackingParams = [
+            // HubSpot tracking
+            '__hstc', '__hssc', '__hsfp', '_hsenc', '_hsmi', 'hsCtaTracking',
+            // Google Analytics / UTM parameters
+            'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'utm_id',
+            // Other common tracking
+            '_gl', '_ga', '_gac', '_gid',
+            // WordPress
+            '_wpnonce',
+            // Generic cache busters
+            't', 'v', 'ver', 'timestamp', 'cache', 'cb'
+        ];
+        // Only delete params that actually exist to avoid unnecessary URL re-serialization.
+        // URLSearchParams.delete() triggers the URL spec's "update steps" which re-serializes
+        // the entire query string using application/x-www-form-urlencoded encoding, changing
+        // %20 to + and potentially altering other percent-encoding. This breaks SHA256 hash
+        // matching for URLs with encoded characters (e.g., Azure Blob Storage SAS tokens).
+        let changed = false;
+        trackingParams.forEach(param => {
+            if (url.searchParams.has(param)) {
+                url.searchParams.delete(param);
+                changed = true;
+            }
+        });
+        return changed ? url.href : urlString;
+    } catch (e) {
+        // If URL parsing fails, return the original URL
+        return urlString;
+    }
+}
+
+// ========================================================================
+// SHARED MANIFEST LOOKUP HELPERS
+// Used by both anchor link processing and onclick element processing
+// ========================================================================
+
+/**
+ * Resolve symlinks recursively and return the final hash
+ * Symlinks in manifest are strings pointing to another hash
+ */
+window.DocAccess.resolveSymlinkHash = function (hash, visited = new Set()) {
+    if (!window.DocAccess.domainDocumentLinkData.hasOwnProperty(hash)) {
+        return hash; // Hash not found, return original
+    }
+
+    const value = window.DocAccess.domainDocumentLinkData[hash];
+
+    // If it's a boolean, this is the final destination
+    if (typeof value === 'boolean') {
+        return hash;
+    }
+
+    // If it's a string, check if it's a symlink (64-char hex hash) or a status value
+    if (typeof value === 'string') {
+        if (value === 'deferred' || value === 'archived' || value === 'processing') {
+            return hash;
+        }
+        // Prevent infinite loops
+        if (visited.has(value)) {
+            console.warn('DocBox: Circular symlink detected', hash, '->', value);
+            return hash; // Return original hash for circular symlinks
+        }
+        visited.add(value);
+        return window.DocAccess.resolveSymlinkHash(value, visited);
+    }
+
+    // Unknown value type, return original hash
+    return hash;
+};
+
+/**
+ * Resolve symlink and return the manifest value (true/false/'archived'/etc)
+ * Returns null if hash not found in manifest
+ */
+window.DocAccess.resolveSymlinkValue = function (hash, visited = new Set()) {
+    if (!window.DocAccess.domainDocumentLinkData.hasOwnProperty(hash)) {
+        return null; // Hash not found
+    }
+
+    const value = window.DocAccess.domainDocumentLinkData[hash];
+
+    // If it's a boolean, return it directly
+    if (typeof value === 'boolean') {
+        return value;
+    }
+
+    // If it's 'archived', return it directly
+    if (value === 'archived') {
+        return 'archived';
+    }
+
+    // If it's 'processing', return it directly (document is being processed)
+    if (value === 'processing') {
+        return 'processing';
+    }
+
+    // If it's 'deferred', return it directly (on-demand transcription)
+    if (value === 'deferred') {
+        return 'deferred';
+    }
+
+    // If it's a string (symlink), follow it
+    if (typeof value === 'string') {
+        // Prevent infinite loops
+        if (visited.has(value)) {
+            console.warn('DocBox: Circular symlink detected', hash, '->', value);
+            return false; // Treat circular symlinks as disabled
+        }
+        visited.add(value);
+        return window.DocAccess.resolveSymlinkValue(value, visited);
+    }
+
+    // Unknown value type, treat as disabled
+    return false;
+};
+
+/**
+ * Determine the URL status based on manifest lookup
+ * Returns: 'enabled', 'disabled', 'archived', 'processing', or 'new'
+ */
+window.DocAccess.getUrlStatus = function (hash, hasForceEnableClass = false) {
+    // Force-enabled elements (docbox-direct, docbox-enable) are always enabled
+    if (hasForceEnableClass) {
+        return 'enabled';
+    }
+
+    // Check if hash exists in manifest
+    if (window.DocAccess.domainDocumentLinkData.hasOwnProperty(hash)) {
+        const resolvedValue = window.DocAccess.resolveSymlinkValue(hash);
+
+        if (resolvedValue === true) {
+            return 'enabled';
+        } else if (resolvedValue === 'deferred') {
+            return 'enabled';
+        } else if (resolvedValue === 'archived') {
+            return 'archived';
+        } else if (resolvedValue === 'processing') {
+            return 'processing';
+        } else {
+            return 'disabled';
+        }
+    }
+
+    // Not in manifest - new document to discover
+    return 'new';
+};
+
+// URL Normalization Patterns
+// Define custom URL transformation rules here
+window.DocAccess.normalizationPatterns = [
+    {
+        // Normalize DocumentCenter/View case and strip slug (e.g., /documentcenter/view/5097/Some-Title -> /DocumentCenter/View/5097)
+        pattern: /^\/documentcenter\/view\/(\d+)(?:\/.*)?$/i,
+        replacement: '/DocumentCenter/View/$1',
+        tags: ['cp-c']
+    },
+    {
+        // Transform /Archive.aspx?ADID=1185 to /ArchiveCenter/ViewFile/Item/1185
+        pattern: /^\/Archive\.aspx\?ADID=(\d+)$/i,
+        replacement: '/ArchiveCenter/ViewFile/Item/$1',
+        tags: ['cp-c']
+    },
+    {
+        // remove timestamps and cachebreakers to prevent duplicate links
+        pattern: /^\/home\/show(document|publisheddocument)\/(\d+)(?:\/\d+)?(?:\?locale=\w+)?$/i,
+        replacement: '/home/showdocument/$2',
+        tags: ['gc']
+    },
+    {
+        // remove timestamps and cachebreakers to prevent duplicate links
+        pattern: /^\/home\/show(document|publisheddocument)\?id=(\d+)(?:&[^#]*)*$/i,
+        replacement: '/home/showdocument/$2',
+        tags: ['gc']
+    },
+    {
+        // Granicus CMS: strip version number from versioned asset/content URLs
+        // Each CMS edit increments a global version counter, creating new URLs for unchanged files
+        // e.g., /files/assets/public/v/400/.../file.pdf -> /files/assets/public/.../file.pdf
+        // e.g., /files/content/public/v/123/.../file.pdf -> /files/content/public/.../file.pdf
+        pattern: /^(\/files\/(?:assets|content)\/public)\/v\/\d+(\/.*)/,
+        replacement: '$1$2',
+        tags: ['gc']
+    },
+    {
+        // WordPress Download Manager normalization - remove path and keep only wpdmdl parameter
+        // e.g., /download/2025-publication/?wpdmdl=10365&refresh=abc -> /?wpdmdl=10365
+        pattern: /^\/.*$/i, // Match any path that starts with /
+        replacement: '/',
+        tags: ['wpdm'],
+        // Special handling for WordPress Download Manager links
+        condition: function (urlPath, searchParams) {
+            return searchParams && searchParams.has('wpdmdl');
+        },
+        preserveParams: ['wpdmdl'] // Keep only the wpdmdl parameter
+    },
+    {
+        // Diligent One Platform - normalize document path and strip volatile params like lastModified
+        // e.g., /document/34561/42oard253230of.../?printPdf=true&lastModified=... -> /document/34561/?printPdf=true
+        // e.g., /document/10857?lastModified=639040298065230000 -> /document/10857/
+        pattern: /^\/document\/(\d+)(\/.*)?$/,
+        replacement: '/document/$1/',
+        preserveParams: ['printPdf'],
+        tags: ['diligent']
+    }
+];
+
+// Helper function to apply normalization patterns to a URL path
+window.DocAccess.applyNormalizationPatterns = function (urlPath, searchParams) {
+    for (const rule of window.DocAccess.normalizationPatterns) {
+        // Check if rule has a condition function
+        if (rule.condition && !rule.condition(urlPath, searchParams)) {
+            continue; // Skip this rule if condition is not met
+        }
+
+        // Check if this is a query-based pattern (includes ?)
+        if (rule.pattern.source.includes('\\?')) {
+            // Reconstruct the path with query string for matching
+            const fullPath = searchParams.toString() ? `${urlPath}?${searchParams.toString()}` : urlPath;
+            const match = fullPath.match(rule.pattern);
+            if (match) {
+                // Apply the replacement and return the new path
+                return {
+                    path: fullPath.replace(rule.pattern, rule.replacement),
+                    clearParams: true, // Indicate that query params should be cleared
+                    preserveParams: rule.preserveParams // Pass along params to preserve
+                };
+            }
+        } else {
+            // Path-only pattern
+            const match = urlPath.match(rule.pattern);
+            if (match) {
+                return {
+                    path: urlPath.replace(rule.pattern, rule.replacement),
+                    clearParams: rule.preserveParams ? false : false, // Don't clear if we want to preserve specific params
+                    preserveParams: rule.preserveParams // Pass along params to preserve
+                };
+            }
+        }
+    }
+    return null; // No pattern matched
+};
+
+// Helper function to apply pattern result to a URL object
+window.DocAccess.applyPatternResultToUrl = function (url, patternResult) {
+    if (!patternResult) return;
+
+    // Update the URL with the normalized path
+    url.pathname = patternResult.path;
+
+    // Handle query parameters based on pattern result
+    if (patternResult.clearParams) {
+        url.search = '';
+    } else if (patternResult.preserveParams) {
+        // Keep only the specified parameters
+        const newParams = new URLSearchParams();
+        for (const param of patternResult.preserveParams) {
+            if (url.searchParams.has(param)) {
+                newParams.set(param, url.searchParams.get(param));
+            }
+        }
+        url.search = newParams.toString();
+    }
+};
+
+// New async function that implements URL normalization with manifest checking
+window.DocAccess.normalizeUrlWithManifestCheck = async function (urlString) {
+    // Check cache first
+    if (window.DocAccess.normalizationCache.has(urlString)) {
+        return window.DocAccess.normalizationCache.get(urlString);
+    }
+
+    // Check for Google Drive links and normalize to direct download URL
+    try {
+        const url = new URL(urlString);
+        if (url.hostname === 'drive.google.com' || url.hostname === 'docs.google.com') {
+            // Skip transformation for published Google Docs (they're HTML, not downloadable files)
+            // Published docs have URLs like: /document/d/e/FILE_ID/pub
+            if (url.pathname.includes('/pub')) {
+                window.DocAccess.normalizationCache.set(urlString, urlString);
+                return urlString;
+            }
+
+            // Extract file ID from various Google Drive URL formats
+            let fileId = null;
+
+            // Format: https://drive.google.com/file/d/FILE_ID/view
+            const fileMatch = url.pathname.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+            if (fileMatch) {
+                fileId = fileMatch[1];
+            }
+
+            // Format: https://drive.google.com/open?id=FILE_ID
+            if (!fileId && url.searchParams.has('id')) {
+                fileId = url.searchParams.get('id');
+            }
+
+            // Format: https://docs.google.com/document/d/FILE_ID/edit
+            // Not supporting sheets or presentations at this time
+            if (!fileId) {
+                const docsMatch = url.pathname.match(/\/(?:document)\/d\/([a-zA-Z0-9_-]+)/);
+                if (docsMatch) {
+                    fileId = docsMatch[1];
+                }
+            }
+
+            if (fileId) {
+                // Convert to direct download URL
+                const normalizedUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+                window.DocAccess.normalizationCache.set(urlString, normalizedUrl);
+                return normalizedUrl;
+            }
+        }
+    } catch (e) {
+        // If URL parsing fails, continue with normal processing
+    }
+
+    // Check for Revize CMS transformation
+    // Skip this transformation when on DocAccess domains to prevent breaking external links
+    /*
+    if (!window.DocAccess.onDocAccessDomain && window.RZ && window.RZ.webspace && window.RZ.protocolRelativeRevizeBaseUrl) {
+        try {
+            const url = new URL(urlString);
+
+            // Extract hostname from protocolRelativeRevizeBaseUrl (e.g., '//cms6.revize.com' -> 'cms6.revize.com')
+            const revizeHostname = window.RZ.protocolRelativeRevizeBaseUrl.replace(/^\/\//, '');
+
+            // Check if this URL should be transformed to Revize CMS
+            // You can add additional hostname checks here if needed
+            if (url.hostname !== revizeHostname) {
+                // Transform to Revize CMS URL
+                const revizeUrl = new URL(url);
+                revizeUrl.hostname = revizeHostname;
+                revizeUrl.pathname = `/revize/${window.RZ.webspace}${url.pathname}`;
+
+                // Cache and return the transformed URL
+                const transformedUrl = revizeUrl.href;
+                window.DocAccess.normalizationCache.set(urlString, transformedUrl);
+                return transformedUrl;
+            }
+        } catch (e) {
+            // If URL parsing fails, continue with normal processing
+        }
+    }
+    */
+
+    if (!window.DocAccess.primaryDomain) {
+        // Cache and return the original if no primary domain
+        window.DocAccess.normalizationCache.set(urlString, urlString);
+        return urlString;
+    }
+
+    try {
+        const url = new URL(urlString);
+
+        // Diligent One Platform (UUID documents): strip /home/public prefix and query params
+        if (url.hostname.includes('diligentoneplatform')) {
+            url.pathname = url.pathname.replace(/^\/home\/public(\/document\/)/, '$1');
+            const uuidMatch = url.pathname.match(/^\/document\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+            if (uuidMatch) {
+                url.pathname = '/document/' + uuidMatch[1];
+                url.search = '';
+            }
+        }
+
+        // Apply custom normalization patterns first
+        const patternResult = window.DocAccess.applyNormalizationPatterns(url.pathname, url.searchParams);
+        window.DocAccess.applyPatternResultToUrl(url, patternResult);
+
+        // Only normalize if the hostname is an alias or the primary domain
+        // Otherwise, keep the original hostname (e.g., S3 URLs)
+        let normalizedUrl;
+        if (window.DocAccess.shouldNormalizeHostname(url.hostname)) {
+            // Step 1: Create the normalized URL (primary domain)
+            normalizedUrl = new URL(url.href); // Use the modified url, not the original urlString
+
+            // Check if current window is specifically www + primaryDomain
+            const currentHostWithoutWww = window.location.hostname.toLowerCase().replace(/^www\./, '');
+            const primaryWithoutWww = window.DocAccess.primaryDomain.toLowerCase().replace(/^www\./, '');
+            const isCurrentWindowWwwPrimary = window.location.hostname.toLowerCase().startsWith('www.') &&
+                currentHostWithoutWww === primaryWithoutWww;
+
+            // If accessing via www.primaryDomain, preserve www for backward compatibility
+            // Otherwise, use the primary domain exactly as configured
+            if (isCurrentWindowWwwPrimary) {
+                normalizedUrl.hostname = 'www.' + primaryWithoutWww;
+            } else {
+                normalizedUrl.hostname = window.DocAccess.primaryDomain.toLowerCase();
+            }
+        } else {
+            // Keep the original URL for external domains
+            normalizedUrl = new URL(url.href); // Use the modified url, not the original urlString
+        }
+
+        // Helper function to check if a hash is enabled (handles symlinks)
+        function isHashEnabled(hash) {
+            if (!window.DocAccess.domainDocumentLinkData.hasOwnProperty(hash)) {
+                return false;
+            }
+
+            const value = window.DocAccess.domainDocumentLinkData[hash];
+
+            // If it's true or deferred, it's enabled (deferred docs open in docviewer with disability assistance)
+            if (value === true || value === 'deferred') {
+                return true;
+            }
+
+            // If it's 'archived', it's not enabled
+            if (value === 'archived') {
+                return false;
+            }
+
+            // If it's a string (symlink), resolve it
+            if (typeof value === 'string') {
+                const resolved = window.DocAccess.resolveSymlinkValue(hash);
+                return resolved === true || resolved === 'deferred';
+            }
+
+            return false;
+        }
+
+        // If we're using www for backward compatibility, first check if canonical (non-www) exists
+        if (normalizedUrl.hostname.startsWith('www.')) {
+            const canonicalUrl = new URL(normalizedUrl.href);
+            canonicalUrl.hostname = canonicalUrl.hostname.replace(/^www\./, '');
+            const canonicalHash = await window.DocAccess.generateSHA256(canonicalUrl.href);
+
+            // If canonical version exists and is enabled, use that instead
+            if (isHashEnabled(canonicalHash)) {
+                window.DocAccess.normalizationCache.set(urlString, canonicalUrl.href);
+                return canonicalUrl.href;
+            }
+        }
+
+        // Otherwise check the normalized URL (which might have www for backward compatibility)
+        const normalizedHash = await window.DocAccess.generateSHA256(normalizedUrl.href);
+
+        if (isHashEnabled(normalizedHash)) {
+            window.DocAccess.normalizationCache.set(urlString, normalizedUrl.href);
+            return normalizedUrl.href;
+        }
+
+        // Step 2: If not found or disabled, check all variants
+        const variants = [];
+        const domains = [window.DocAccess.primaryDomain, ...window.DocAccess.domainAliases];
+
+        // Generate all domain variants (with and without www)
+        for (const domain of domains) {
+            // Without www
+            const variantUrl1 = new URL(urlString);
+            variantUrl1.hostname = domain.toLowerCase().replace(/^www\./, '');
+
+            // Apply normalization patterns to this variant too
+            const patternResult1 = window.DocAccess.applyNormalizationPatterns(variantUrl1.pathname, variantUrl1.searchParams);
+            window.DocAccess.applyPatternResultToUrl(variantUrl1, patternResult1);
+
+            variants.push(variantUrl1.href);
+
+            // With www
+            const variantUrl2 = new URL(urlString);
+            variantUrl2.hostname = 'www.' + domain.toLowerCase().replace(/^www\./, '');
+
+            // Apply normalization patterns to this variant too
+            const patternResult2 = window.DocAccess.applyNormalizationPatterns(variantUrl2.pathname, variantUrl2.searchParams);
+            window.DocAccess.applyPatternResultToUrl(variantUrl2, patternResult2);
+
+            variants.push(variantUrl2.href);
+        }
+
+        // Also check https version if current is http
+        if (url.protocol === 'http:') {
+            const httpsUrl = new URL(url.href); // Use the modified url, not the original urlString
+            httpsUrl.protocol = 'https:';
+
+            // Add https variants for all domains
+            for (const domain of domains) {
+                // Without www
+                const httpsVariant1 = new URL(httpsUrl);
+                httpsVariant1.hostname = domain.toLowerCase().replace(/^www\./, '');
+
+                // Apply normalization patterns to this variant too
+                const patternResult1 = window.DocAccess.applyNormalizationPatterns(httpsVariant1.pathname, httpsVariant1.searchParams);
+                window.DocAccess.applyPatternResultToUrl(httpsVariant1, patternResult1);
+
+                variants.push(httpsVariant1.href);
+
+                // With www
+                const httpsVariant2 = new URL(httpsUrl);
+                httpsVariant2.hostname = 'www.' + domain.toLowerCase().replace(/^www\./, '');
+
+                // Apply normalization patterns to this variant too
+                const patternResult2 = window.DocAccess.applyNormalizationPatterns(httpsVariant2.pathname, httpsVariant2.searchParams);
+                window.DocAccess.applyPatternResultToUrl(httpsVariant2, patternResult2);
+
+                variants.push(httpsVariant2.href);
+            }
+        }
+
+        // Semantic parameters define document type and must never be stripped
+        // (e.g., packet=true differentiates agenda packet from individual)
+        const SEMANTIC_PARAMS = ['packet'];
+
+        // On Diligent One Platform and HighBond, printPdf=true differentiates
+        // the individual agenda from the packet — treat it as semantic.
+        // On CivicClerk/CivicWeb it's just a rendering flag on the same document.
+        const host = url.hostname;
+        if (host.includes('diligentoneplatform') || host.includes('diligent.community') || host.includes('highbond')) {
+            SEMANTIC_PARAMS.push('printPdf');
+        }
+
+        function getSemanticSearch(searchParams) {
+            const kept = [];
+            for (const p of SEMANTIC_PARAMS) {
+                if (searchParams.has(p)) kept.push(`${p}=${encodeURIComponent(searchParams.get(p))}`);
+            }
+            return kept.length ? '?' + kept.join('&') : '';
+        }
+
+        const hasNonSemanticParams = [...url.searchParams.keys()].some(k => !SEMANTIC_PARAMS.includes(k));
+
+        // If URL has query parameters beyond semantic ones, also check versions without them
+        const hasQueryParams = url.search && url.search.length > 1;
+        if (hasQueryParams && hasNonSemanticParams) {
+            const noParamVariants = [];
+            const firstParamOnlyVariants = [];
+
+            for (const variant of variants) {
+                try {
+                    const variantUrl = new URL(variant);
+                    if (variantUrl.search) {
+                        const variantSemantic = getSemanticSearch(variantUrl.searchParams);
+
+                        // Version without volatile params (keep only semantic params)
+                        const noParamUrl = new URL(variant);
+                        noParamUrl.search = variantSemantic;
+                        noParamVariants.push(noParamUrl.href);
+
+                        // Version with only the first query parameter (+ semantic params)
+                        const searchParams = variantUrl.searchParams;
+                        const firstParamKey = searchParams.keys().next().value;
+                        if (firstParamKey) {
+                            const firstParamUrl = new URL(variant);
+                            const firstParamValue = searchParams.get(firstParamKey);
+
+                            if (SEMANTIC_PARAMS.includes(firstParamKey)) {
+                                firstParamUrl.search = variantSemantic;
+                            } else {
+                                firstParamUrl.search = `?${firstParamKey}=${encodeURIComponent(firstParamValue)}`;
+                                // Re-append semantic params that were present
+                                for (const p of SEMANTIC_PARAMS) {
+                                    if (variantUrl.searchParams.has(p)) {
+                                        firstParamUrl.searchParams.set(p, variantUrl.searchParams.get(p));
+                                    }
+                                }
+                            }
+                            firstParamOnlyVariants.push(firstParamUrl.href);
+                        }
+                    }
+                } catch (e) {
+                    // Skip invalid URLs
+                }
+            }
+
+            variants.push(...noParamVariants);
+            variants.push(...firstParamOnlyVariants);
+        }
+
+        // Remove duplicates
+        const uniqueVariants = [...new Set(variants)];
+
+        // Check each variant
+        let enabledUrl = null;
+        let disabledUrl = null;
+
+        for (const variant of uniqueVariants) {
+            const variantHash = await window.DocAccess.generateSHA256(variant);
+
+            if (window.DocAccess.domainDocumentLinkData.hasOwnProperty(variantHash)) {
+                if (isHashEnabled(variantHash)) {
+                    // Found enabled variant - cache and use this immediately
+                    window.DocAccess.normalizationCache.set(urlString, variant);
+                    return variant;
+                } else {
+                    // Found disabled variant - remember it
+                    disabledUrl = variant;
+                }
+            }
+        }
+
+        // If we found a disabled URL but no enabled one, use the disabled URL
+        if (disabledUrl) {
+            window.DocAccess.normalizationCache.set(urlString, disabledUrl);
+            return disabledUrl;
+        }
+
+        // No variants found in manifest - cache and return normalized URL
+        window.DocAccess.normalizationCache.set(urlString, normalizedUrl.href);
+        return normalizedUrl.href;
+
+    } catch (e) {
+        // If URL parsing fails, cache and return the original URL
+        window.DocAccess.normalizationCache.set(urlString, urlString);
+        return urlString;
+    }
+}
+
+
+window.DocAccess.initializeDocBox = function () {
+    // Mark that initializeDocBox has been called
+    window.DocAccess.initializeDocBoxCalled = true;
+
+    // Variables to track Escape key presses for double-tap functionality
+    let lastEscapeTime = 0;
+    const DOUBLE_ESCAPE_THRESHOLD = 3000; // 3 seconds - allows for motor disabilities
+
+    // Listen for popstate events (back/forward navigation)
+    window.addEventListener('popstate', function (event) {
+        // Prevent recursive calls
+        if (window.DocAccess.isHandlingHashChange) {
+            return;
+        }
+
+        window.DocAccess.isHandlingHashChange = true;
+
+        try {
+            const currentHash = window.location.hash;
+
+            // Check if we have a docaccess anchor
+            if (currentHash.startsWith('#docaccess-')) {
+                // Check if we have state data from the history
+                if (event.state && event.state.docaccess) {
+                    // Reopen the lightbox with the state from history
+                    openLightbox(event.state.pdfUrl, event.state.direct, event.state.domain, null, event.state.title);
+                } else {
+                    // No state data - try to find the document by hash
+                    const docHash = currentHash.substring('#docaccess-'.length);
+                    openDocumentFromHash(docHash);
+                }
+            } else {
+                // No docaccess hash - close the lightbox if it's open
+                const lightbox = document.getElementById('docbox-overlay');
+                if (lightbox && lightbox.style.display === 'flex') {
+                    closeLightbox(false); // false = don't manipulate history
+                }
+            }
+        } finally {
+            window.DocAccess.isHandlingHashChange = false;
+        }
+    });
+
+    // Listen for messages from the iframe (for cross-origin Escape key handling)
+    window.addEventListener('message', function (event) {
+        // Only process messages from our iframes
+        const iframe = document.getElementById('docbox-iframe');
+        const lightbox = document.getElementById('docbox-overlay');
+
+        // Check if lightbox and iframe exist and lightbox is visible
+        if (!iframe || !lightbox || lightbox.style.display === 'none') {
+            return;
+        }
+
+        // Check if the message is from our iframe by comparing origins
+        try {
+            // First check if iframe has a valid src
+            if (!iframe.src || iframe.src === 'about:blank' || iframe.src === '') {
+                // For empty iframes, we can't verify origin, so be more careful
+                // Only accept messages from known docaccess domains
+                if (!event.origin.endsWith('docaccess.com') && !event.origin.includes('localhost')) {
+                    return;
+                }
+            } else {
+                const iframeOrigin = new URL(iframe.src).origin;
+
+                // More permissive origin check - allow any HTTPS origin or docaccess domains
+                const isFromDocAccess = event.origin.endsWith('docaccess.com') || event.origin === 'https://docaccess.com';
+                const isSameOrigin = event.origin === iframeOrigin;
+                const isLocalhost = event.origin.includes('localhost') || iframeOrigin.includes('localhost');
+
+                if (!isSameOrigin && !isFromDocAccess && !isLocalhost) {
+                    return; // Ignore messages from other origins
+                }
+            }
+        } catch (e) {
+            // If we can't parse the iframe URL, fall back to checking if the message is from a trusted domain
+            if (!event.origin.endsWith('docaccess.com') && !event.origin.includes('localhost')) {
+                return;
+            }
+        }
+
+        // Handle different message types
+        if (event.data && typeof event.data === 'object') {
+            if (event.data.type === 'docaccess-close-viewer') {
+                // Close the lightbox
+                closeLightbox(true);
+                // Announce to screen readers
+                announceToScreenReader('Document viewer closed', 2000);
+            } else if (event.data.type === 'docaccess-escape-hint') {
+                // Show the escape hint
+                showEscapeHint();
+            } else if (event.data.type === 'docaccess-check-file-hash') {
+                if (window.DocAccess.versionCheckDisabled) {
+                    window.DocAccess._log('[DocAccess] Version checking disabled for this domain, skipping hash check');
+                    return;
+                }
+                queueHashCheckRequest(event.data, event.source, event.origin);
+                loadVersionChecker();
+            }
+        }
+    });
+
+    // Queue for pending hash check requests (handles race condition on first load)
+    if (!window.DocAccess.pendingHashCheckRequests) {
+        window.DocAccess.pendingHashCheckRequests = [];
+    }
+
+    // Queue a hash check request to be processed once version checker loads
+    function queueHashCheckRequest(data, source, origin) {
+        window.DocAccess.pendingHashCheckRequests.push({ data, source, origin });
+        window.DocAccess._log('[DocAccess] Queued hash check request for:', data.url);
+    }
+
+    // Load the document version checker module on demand
+    function loadVersionChecker() {
+        if (window.DocAccess.versionCheckerLoaded) {
+            // Already loaded - process any pending requests immediately
+            processPendingHashCheckRequests();
+            return;
+        }
+
+        if (window.DocAccess.versionCheckerLoading) {
+            return; // Currently loading
+        }
+
+        window.DocAccess.versionCheckerLoading = true;
+
+        const script = document.createElement('script');
+        script.src = window.DocAccess.scriptOrigin + '/docbox-check-document-version.js';
+        script.async = true;
+        script.onload = function () {
+            window.DocAccess._log('[DocAccess] Version checker module loaded');
+            // Process any requests that were queued while loading
+            processPendingHashCheckRequests();
+        };
+        script.onerror = function () {
+            window.DocAccess._log('[DocAccess] Failed to load version checker module');
+            window.DocAccess.versionCheckerLoading = false;
+        };
+        document.head.appendChild(script);
+    }
+
+    // Process any pending hash check requests after version checker loads
+    function processPendingHashCheckRequests() {
+        if (!window.DocAccess.pendingHashCheckRequests ||
+            window.DocAccess.pendingHashCheckRequests.length === 0) {
+            return;
+        }
+
+        window.DocAccess._log('[DocAccess] Processing', window.DocAccess.pendingHashCheckRequests.length, 'pending hash check requests');
+
+        // The version checker module exposes a function to handle requests
+        if (window.DocAccess.handleHashCheckRequest) {
+            while (window.DocAccess.pendingHashCheckRequests.length > 0) {
+                const { data, source, origin } = window.DocAccess.pendingHashCheckRequests.shift();
+                window.DocAccess.handleHashCheckRequest(data, source, origin);
+            }
+        } else {
+            window.DocAccess._log('[DocAccess] Version checker handleHashCheckRequest not available');
+        }
+    }
+
+    // Helper function to show escape hint
+    function showEscapeHint() {
+        // Remove any existing hint first
+        const existingHint = document.getElementById('docbox-escape-hint');
+        if (existingHint) {
+            existingHint.remove();
+        }
+
+        const hint = document.createElement('div');
+        hint.id = 'docbox-escape-hint';
+        hint.style.cssText = `
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 15px 30px;
+            border-radius: 5px;
+            font-size: 16px;
+            z-index: 19999999;
+            pointer-events: none;
+        `;
+        hint.textContent = 'Press Escape again to close document';
+        hint.setAttribute('role', 'status');
+        hint.setAttribute('aria-live', 'polite');
+        getLightboxContainer().appendChild(hint);
+
+        setTimeout(() => {
+            if (hint.parentNode) {
+                hint.parentNode.removeChild(hint);
+            }
+        }, 3500); // Show hint for full double-tap window plus buffer
+    }
+
+    // Helper function for screen reader announcements
+    function announceToScreenReader(message, duration = 3000) {
+        const announcement = document.createElement('div');
+        announcement.setAttribute('role', 'status');
+        announcement.setAttribute('aria-live', 'polite');
+        announcement.className = 'sr-only';
+        announcement.textContent = message;
+        getLightboxContainer().appendChild(announcement);
+
+        setTimeout(() => {
+            if (announcement.parentNode) {
+                announcement.parentNode.removeChild(announcement);
+            }
+        }, duration);
+    }
+
+    // Create the lightbox elements
+    function createLightbox() {
+        // Add inert polyfill for browsers that don't support it natively
+        if (!('inert' in HTMLElement.prototype)) {
+            // Simple polyfill - just add aria-hidden and tabindex=-1 to all focusable elements
+            Object.defineProperty(HTMLElement.prototype, 'inert', {
+                get: function () {
+                    return this.hasAttribute('inert');
+                },
+                set: function (value) {
+                    if (value) {
+                        this.setAttribute('inert', '');
+                        this.setAttribute('aria-hidden', 'true');
+                        // Find all focusable elements and make them unfocusable
+                        const focusableElements = this.querySelectorAll('a, button, input, textarea, select, [tabindex]:not([tabindex="-1"])');
+                        focusableElements.forEach(el => {
+                            if (el.hasAttribute('tabindex')) {
+                                el.dataset.docboxOriginalTabindex = el.getAttribute('tabindex');
+                            }
+                            el.setAttribute('tabindex', '-1');
+                        });
+                    } else {
+                        this.removeAttribute('inert');
+                        this.removeAttribute('aria-hidden');
+                        // Restore original tabindex values
+                        const focusableElements = this.querySelectorAll('[data-docbox-original-tabindex]');
+                        focusableElements.forEach(el => {
+                            el.setAttribute('tabindex', el.dataset.docboxOriginalTabindex);
+                            delete el.dataset.docboxOriginalTabindex;
+                        });
+                        // Remove tabindex from elements that didn't have it originally
+                        const modifiedElements = this.querySelectorAll('[tabindex="-1"]:not([data-docbox-original-tabindex])');
+                        modifiedElements.forEach(el => {
+                            if (!el.dataset.docboxOriginalTabindex) {
+                                el.removeAttribute('tabindex');
+                            }
+                        });
+                    }
+                }
+            });
+        }
+
+        // Ensure sr-only class exists for screen reader announcements
+        if (!document.querySelector('style[data-docbox-sr-only]')) {
+            const style = document.createElement('style');
+            style.setAttribute('data-docbox-sr-only', 'true');
+            style.textContent = `
+                .sr-only {
+                    position: absolute;
+                    width: 1px;
+                    height: 1px;
+                    padding: 0;
+                    margin: -1px;
+                    overflow: hidden;
+                    clip: rect(0, 0, 0, 0);
+                    white-space: nowrap;
+                    border: 0;
+                }
+                
+                /* Highlight animation for returning focus 
+                .docaccess-returning-focus {
+                    outline: 3px solid #2563eb !important;
+                    outline-offset: 2px !important;
+                    position: relative;
+                    z-index: 10;
+                    animation: docaccess-pulse 2s ease-out;
+                }
+                */
+                
+                @keyframes docaccess-pulse {
+                    0% {
+                        box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.4);
+                    }
+                    50% {
+                        box-shadow: 0 0 0 10px rgba(37, 99, 235, 0);
+                    }
+                    100% {
+                        box-shadow: 0 0 0 0 rgba(37, 99, 235, 0);
+                    }
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        const lightbox = document.createElement('div');
+        lightbox.id = 'docbox-overlay';
+        lightbox.style.cssText = `
+position: fixed;
+top: 0;
+left: 0;
+width: 100%;
+height: 100%;
+background-color: rgba(0, 0, 0, 0.8);
+z-index: 9999999999;
+display: none;
+justify-content: center;
+align-items: end;
+`;
+
+        const container = document.createElement('div');
+        container.id = 'docbox-container';
+        container.style.cssText = `
+width: 100%;
+height: calc(100% - 40px);
+background-color: transparent;
+position: relative;
+border-radius: 5px;
+box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+`;
+
+        const closeBtn = document.createElement('button');
+        closeBtn.id = 'docbox-close';
+        closeBtn.innerHTML = '<span aria-hidden="true">Close <b>&nbsp;&times;</b></span>';
+        closeBtn.setAttribute('aria-label', 'Close document');
+        closeBtn.style.cssText = `
+    position: fixed;
+    top: 5px;
+    right: 5px;
+    font-size: 20px;
+    cursor: pointer;
+    z-index: 10001;
+    border-radius: 5px;
+    height: 30px;
+    width: auto;
+    line-height: 30px;
+    background: rgb(0, 0, 0) !important;
+    border: none !important;
+    color: white !important;
+    padding: 0 15px;
+    font-size: 16px;
+`;
+        closeBtn.addEventListener('click', function () { closeLightbox(true); });
+
+        const iframe = document.createElement('iframe');
+        iframe.id = 'docbox-iframe';
+        iframe.style.cssText = `
+width: 100%;
+height: 100%;
+border: none;
+border-radius: 5px;
+`;
+        if (DocAccess.currentDomain.endsWith('docaccess.com')) {
+            iframe.allow = "autoplay";
+        }
+
+        iframe.ariaLabel = 'Document viewer';
+
+        if (
+            (typeof document.fullscreenEnabled !== 'undefined' && document.fullscreenEnabled) ||
+            (typeof document.webkitFullscreenEnabled !== 'undefined' && document.webkitFullscreenEnabled) ||
+            (typeof document.mozFullScreenEnabled !== 'undefined' && document.mozFullScreenEnabled) ||
+            (typeof document.msFullscreenEnabled !== 'undefined' && document.msFullscreenEnabled)
+        ) {
+            iframe.allowFullscreen = true;
+        }
+
+        container.appendChild(closeBtn);
+        container.appendChild(iframe);
+        lightbox.appendChild(container);
+        getLightboxContainer().appendChild(lightbox);
+
+        // Close lightbox when clicking outside the container
+        lightbox.addEventListener('click', function (e) {
+            if (e.target === lightbox) {
+                closeLightbox(true);
+            }
+        });
+
+        // Close lightbox with Escape key (double-tap support)
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape' && lightbox.style.display === 'flex') {
+                try {
+                    const currentTime = Date.now();
+
+                    // Check if this is a double-tap
+                    if (currentTime - lastEscapeTime < DOUBLE_ESCAPE_THRESHOLD) {
+                        // Double Escape pressed - close the lightbox
+                        closeLightbox(true);
+                        lastEscapeTime = 0; // Reset
+
+                        // Announce to screen readers
+                        announceToScreenReader('Document viewer closed', 2000);
+                    } else {
+                        // First Escape press - update the timestamp
+                        lastEscapeTime = currentTime;
+
+                        // Announce to screen reader
+                        announceToScreenReader('Press Escape again to close');
+
+                        // Try to handle Escape in the iframe first (for same-origin)
+                        try {
+                            const iframe = document.getElementById('docbox-iframe');
+                            const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
+                            if (iframeDoc) {
+                                // Check if any dialogs are open in the iframe
+                                const openDialogs = iframeDoc.querySelectorAll('[role="dialog"]:not([style*="display: none"])');
+                                const visibleTooltips = iframeDoc.querySelectorAll('.tooltip:not([hidden])');
+
+                                if (openDialogs.length === 0 && visibleTooltips.length === 0) {
+                                    // No dialogs open - show hint
+                                    showEscapeHint();
+                                }
+                            }
+                        } catch (e) {
+                            // Cross-origin iframe - show hint anyway
+                            showEscapeHint();
+                        }
+                    }
+                } catch (error) {
+                    console.error('DocBox: Error handling Escape key:', error);
+                    // Ensure lightbox closes even if there's an error
+                    try {
+                        closeLightbox(true);
+                    } catch (e) {
+                        console.error('DocBox: Failed to close lightbox after error:', e);
+                    }
+                }
+            }
+        });
+    }
+
+    // Build the docviewer URL from the given parameters. Shared by the lightbox
+    // and open-in-new-tab code paths so they stay in sync.
+    function buildDocviewerUrl(pdfUrl, { base, urlHash, domain, title, direct } = {}) {
+        let url = direct
+            ? pdfUrl
+            : `${base}/docviewer.html?url=${encodeURIComponent(pdfUrl)}`;
+        if (!direct && urlHash) url += `&url_hash=${encodeURIComponent(urlHash)}`;
+        if (domain) url += `&domain=${encodeURIComponent(domain)}`;
+        if (title) url += `&title=${encodeURIComponent(title)}`;
+        if (window.DocAccess.defaultTranscriptView) url += '&view=transcript';
+        if (window.DocAccess.versionCheckDisabled) url += '&vcd=1';
+        const lang = window.DocAccess.getDetectedLanguage ? window.DocAccess.getDetectedLanguage() : null;
+        window.DocAccess._log('Opening docviewer, detectedLang:', lang);
+        if (lang && !lang.startsWith('en')) {
+            url += `&lang=${encodeURIComponent(lang)}`;
+            window.DocAccess._log('Adding lang param to docviewer URL:', lang);
+        }
+        return url;
+    }
+
+    // Resolve the script root for the docviewer iframe URL.
+    // Preserves docaccess.com subdomains, defaults to docaccess.com for localhost.
+    function resolveScriptRoot() {
+        let scriptDomain = '';
+        let scriptSrc = '';
+        if (document.currentScript && document.currentScript.src) {
+            scriptSrc = document.currentScript.src;
+        } else {
+            const scripts = document.getElementsByTagName('script');
+            for (let i = 0; i < scripts.length; i++) {
+                if (scripts[i].src && scripts[i].src.match(/docbox\.js(\?.*)?$/)) {
+                    scriptSrc = scripts[i].src;
+                    break;
+                }
+            }
+        }
+        if (scriptSrc) {
+            try {
+                const url = new URL(scriptSrc, window.location.origin);
+                scriptDomain = url.hostname;
+            } catch (e) {
+                scriptDomain = '';
+            }
+        }
+
+        let scriptRoot = 'https://' + scriptDomain;
+        if (!scriptDomain || window.DocAccess.currentDomain == 'localhost') {
+            scriptRoot = 'https://docaccess.com';
+        } else if (window.DocAccess.currentDomain === 'docaccess.com') {
+            scriptRoot = 'https://docaccess.com';
+        }
+        return scriptRoot;
+    }
+
+    // Open the lightbox with the given PDF URL
+    async function openLightbox(pdfUrl, direct = false, domain = '', fromLink = null, title = null, providedHash = null) {
+        // If we're inside a same-origin iframe and the parent has DocBox,
+        // delegate to the parent so the viewer opens full-screen
+        if (window !== window.top) {
+            try {
+                const parentDocBox = window.parent.DocBox;
+                if (parentDocBox && typeof parentDocBox.open === 'function') {
+                    parentDocBox.open(pdfUrl, direct, domain, null, title, providedHash);
+                    return;
+                }
+            } catch (e) {
+                // Cross-origin parent -- fall through to open locally
+            }
+        }
+
+        const lightbox = document.getElementById('docbox-overlay');
+        const iframe = document.getElementById('docbox-iframe');
+
+        // Store the link reference if provided
+        if (fromLink) {
+            window.DocAccess.lastActivatedLink = fromLink;
+        }
+
+        // Use provided hash if available, otherwise generate from URL
+        const docHash = providedHash || await window.DocAccess.generateSHA256(pdfUrl);
+
+        // Resolve any redirects in the manifest (use shared helper)
+        let resolvedHash = window.DocAccess.resolveSymlinkHash(docHash);
+
+        // Expose current document context for the overlay admin bar
+        window.DocAccess.activeLightbox = {
+            resolvedHash: resolvedHash,
+            domain: domain
+        };
+
+        // Only add history entry if we're not already handling a hashchange
+        // and if there's no existing anchor in the URL
+        const shouldAddHistory = !window.DocAccess.isHandlingHashChange &&
+            !window.location.hash;
+
+        if (shouldAddHistory) {
+            // Use just the document hash - domain is inferred from context
+            const hash = `#docaccess-${docHash}`;
+
+            // Store the current state
+            window.DocAccess.currentLightboxState = {
+                hash: hash,
+                pdfUrl: pdfUrl,
+                direct: direct,
+                domain: domain,
+                docHash: docHash,
+                title: title
+            };
+
+            // Add to browser history with full URL preserved
+            const currentUrlWithoutHash = window.location.href.split('#')[0];
+            window.history.pushState(
+                { docaccess: true, pdfUrl: pdfUrl, direct: direct, domain: domain, docHash: docHash, title: title },
+                '',
+                currentUrlWithoutHash + hash
+            );
+        }
+
+        const docviewerUrl = buildDocviewerUrl(pdfUrl, {
+            base: resolveScriptRoot(),
+            urlHash: resolvedHash,
+            domain: domain,
+            title: title,
+            direct: direct
+        });
+
+        window.DocAccess._log('Final docviewer URL:', docviewerUrl);
+        iframe.src = docviewerUrl;
+
+        // Display the lightbox
+        lightbox.style.display = 'flex';
+
+        // Prevent scrolling on the body
+        document.body.style.overflow = 'hidden';
+
+        // Make all content except the lightbox inert
+        const lightboxElement = document.getElementById('docbox-overlay');
+        const allElements = document.body.children;
+        for (let i = 0; i < allElements.length; i++) {
+            const element = allElements[i];
+            if (element !== lightboxElement && element.id !== 'docbox-overlay') {
+                // Store original inert state to restore later
+                if (element.hasAttribute('inert')) {
+                    element.dataset.docboxOriginalInert = 'true';
+                } else {
+                    element.setAttribute('inert', '');
+                }
+            }
+        }
+
+        // Set immediate focus to iframe for faster accessibility
+        iframe.focus();
+
+        // Set focus to the iframe after it loads for screen reader users
+        iframe.addEventListener('load', function handleIframeLoad() {
+            // Remove the event listener to prevent multiple calls
+            iframe.removeEventListener('load', handleIframeLoad);
+
+            // Focus the iframe
+            iframe.focus();
+
+            // Try to focus inside the iframe's document if same-origin
+            try {
+                const iframeDoc = iframe.contentDocument || iframe.contentWindow.document;
+                if (iframeDoc && iframeDoc.body) {
+                    // Add Escape key listener to iframe document for double-tap support
+                    iframeDoc.addEventListener('keydown', function (e) {
+                        if (e.key === 'Escape') {
+                            const currentTime = Date.now();
+
+                            // Check if this is a double-tap
+                            if (currentTime - lastEscapeTime < DOUBLE_ESCAPE_THRESHOLD) {
+                                // Double Escape pressed - close the lightbox
+                                closeLightbox(true);
+                                lastEscapeTime = 0; // Reset
+
+                                // Announce to screen readers
+                                announceToScreenReader('Document closed', 2000);
+                            } else {
+                                // First Escape press - update the timestamp
+                                lastEscapeTime = currentTime;
+
+                                // Announce to screen reader
+                                announceToScreenReader('Press Escape again to close');
+
+                                // Check if any dialogs are open
+                                const openDialogs = iframeDoc.querySelectorAll('[role="dialog"]:not([style*="display: none"])');
+                                const visibleTooltips = iframeDoc.querySelectorAll('.tooltip:not([hidden])');
+
+                                if (openDialogs.length === 0 && visibleTooltips.length === 0) {
+                                    // No dialogs open - show hint
+                                    showEscapeHint();
+                                }
+                            }
+                        }
+                    });
+
+                    // Focus the body to allow natural tab order starting with skip link
+                    // This ensures the skip link is the first element when tabbing
+                    iframeDoc.body.focus();
+                }
+            } catch (e) {
+                // Cross-origin, can't access iframe content
+
+            }
+        });
+
+        // Announce to screen readers that a document has opened
+        announceToScreenReader('Document opened. Escape twice to close.');
+    }
+
+    // Close the lightbox
+    function closeLightbox(manipulateHistory = true) {
+        const lightbox = document.getElementById('docbox-overlay');
+        const iframe = document.getElementById('docbox-iframe');
+
+        // Hide the lightbox
+        if (lightbox) {
+            lightbox.style.display = 'none';
+        }
+
+        // Clear the iframe source
+        if (iframe) {
+            iframe.src = '';
+        }
+
+        // Re-enable scrolling on the body
+        document.body.style.overflow = '';
+
+        // Robust cleanup of inert attributes
+        try {
+            // Method 1: Clean up based on our tracking attributes
+            const trackedElements = document.querySelectorAll('[data-docbox-original-inert]');
+            trackedElements.forEach(element => {
+                // These elements were originally inert, keep them inert
+                delete element.dataset.docboxOriginalInert;
+            });
+
+            // Method 2: Remove inert from all elements except those that should keep it
+            const allInertElements = document.querySelectorAll('[inert]');
+            allInertElements.forEach(element => {
+                // Skip the lightbox itself (in case it's still in DOM)
+                if (element.id === 'docbox-overlay') {
+                    return;
+                }
+
+                // If this element wasn't tracked as originally inert, remove inert
+                if (!element.hasAttribute('data-docbox-original-inert')) {
+                    element.removeAttribute('inert');
+                    element.removeAttribute('aria-hidden');
+                }
+            });
+
+            // Method 3: Fallback - ensure all body children are cleaned up
+            const allElements = document.body.children;
+            for (let i = 0; i < allElements.length; i++) {
+                const element = allElements[i];
+                // Skip the lightbox
+                if (element.id === 'docbox-overlay') {
+                    continue;
+                }
+
+                // Only remove inert if we added it (not if it was originally inert)
+                if (element.hasAttribute('inert') && !element.dataset.docboxOriginalInert) {
+                    element.removeAttribute('inert');
+                }
+                // Always clean up our tracking attribute
+                delete element.dataset.docboxOriginalInert;
+            }
+
+            // Final safety check: if lightbox is hidden but inert elements remain, remove them
+            if (!lightbox || lightbox.style.display === 'none') {
+                // Give it a moment for any async operations, then do final cleanup
+                setTimeout(() => {
+                    const remainingInert = document.querySelectorAll('body > [inert]:not(#docbox-overlay)');
+                    remainingInert.forEach(element => {
+                        if (!element.dataset.docboxOriginalInert) {
+                            console.warn('DocBox: Removing orphaned inert attribute from', element);
+                            element.removeAttribute('inert');
+                        }
+                    });
+                }, 100);
+            }
+        } catch (error) {
+            console.error('DocBox: Error during inert cleanup:', error);
+            // Emergency cleanup - remove all inert attributes except on lightbox
+            try {
+                document.querySelectorAll('[inert]:not(#docbox-overlay)').forEach(element => {
+                    element.removeAttribute('inert');
+                });
+            } catch (e) {
+                console.error('DocBox: Emergency cleanup also failed:', e);
+            }
+        }
+
+        // Reset escape timer
+        lastEscapeTime = 0;
+
+        // Remove the escape hint immediately
+        const escapeHint = document.getElementById('docbox-escape-hint');
+        if (escapeHint) {
+            escapeHint.remove();
+        }
+
+        // Remove the tooltip
+        const tooltip = document.getElementById('transcript-view-tooltip');
+        if (tooltip) {
+            tooltip.parentNode.removeChild(tooltip);
+        }
+
+        // Handle history manipulation
+        if (manipulateHistory && !window.DocAccess.isHandlingHashChange) {
+            // Check if we have a docaccess hash in the URL
+            if (window.location.hash.startsWith('#docaccess-')) {
+                // Get the current URL without the hash
+                const currentUrl = window.location.href.split('#')[0];
+                // Push a new state without the hash to preserve the document open state in history
+                window.history.pushState(null, '', currentUrl);
+            }
+        }
+
+        // Don't clear the state - keep it for potential forward navigation
+
+        // Restore focus to the link that opened the lightbox
+        if (window.DocAccess.lastActivatedLink) {
+            // Add a highlight class temporarily
+            window.DocAccess.lastActivatedLink.classList.add('docaccess-returning-focus');
+
+            // Focus the link
+            window.DocAccess.lastActivatedLink.focus();
+
+            // Announce to screen readers
+            announceToScreenReader('Returned to document link');
+
+            // Remove the highlight after a short delay
+            setTimeout(() => {
+                if (window.DocAccess.lastActivatedLink) {
+                    window.DocAccess.lastActivatedLink.classList.remove('docaccess-returning-focus');
+                }
+            }, 2000);
+        }
+    }
+
+
+    // Helper function to find the best place to append the lightbox
+    function getLightboxContainer() {
+        // Check for frameset first - some browsers may have body even with framesets
+        // This is due to an unfortunate situations where some rare gov applications still use framesets
+        if (document.querySelector('frameset')) {
+            // We're in a frameset document, use the html element
+            return document.documentElement;
+        }
+
+        // Normal document with body
+        if (document.body) {
+            return document.body;
+        }
+
+        // Fallback to html element
+        return document.documentElement;
+    }
+
+    // Helper function to collect links from a document and its frames
+    function collectLinksFromDocument(doc, selector) {
+        const links = [];
+
+        // Get links from the current document
+        links.push(...doc.querySelectorAll(selector));
+
+        // Check for frames and framesets (legacy sites)
+        try {
+            // Check regular frames
+            const frames = doc.querySelectorAll('frame, iframe');
+            frames.forEach(frame => {
+                try {
+                    const frameDoc = frame.contentDocument || frame.contentWindow?.document;
+                    if (frameDoc && frameDoc.readyState === 'complete') {
+                        links.push(...collectLinksFromDocument(frameDoc, selector));
+                    }
+                } catch (e) {
+                    // Cross-origin frame, skip it
+                }
+            });
+
+            // Also check window.frames collection for older sites
+            if (doc.defaultView && doc.defaultView.frames) {
+                for (let i = 0; i < doc.defaultView.frames.length; i++) {
+                    try {
+                        const frameDoc = doc.defaultView.frames[i].document;
+                        if (frameDoc && frameDoc.readyState === 'complete') {
+                            links.push(...collectLinksFromDocument(frameDoc, selector));
+                        }
+                    } catch (e) {
+                        // Cross-origin frame, skip it
+                    }
+                }
+            }
+        } catch (e) {
+            // Frame access error, continue with what we have
+        }
+
+        return links;
+    }
+
+    // Find all PDF links and attach click handlers
+    // using common patterns found on institution and government websites
+    // including those that do not end in .pdf
+    function initPdfLinks(event, selector = window.DocAccess.commonFilePatterns) {
+        // Don't process any links until domain data is loaded
+        // This prevents partial processing with incorrect normalization
+        if (!window.DocAccess.domainDataLoaded) {
+            return;
+        }
+
+        // Skip if batch processing is already in progress
+        if (window.DocAccess.isBatchProcessing) {
+            return;
+        }
+
+        // Create the lightbox if it doesn't exist
+        if (!document.getElementById('docbox-overlay')) {
+            createLightbox();
+        }
+
+        // Find all links including those in frames/framesets
+        const pdfLinks = collectLinksFromDocument(document, selector);
+
+        // If included paths are configured, also collect links matching those patterns
+        let includedLinks = [];
+        if (window.DocAccess.includedPaths && window.DocAccess.includedPaths.length > 0) {
+            // Get all links on the page
+            const allLinks = collectLinksFromDocument(document, 'a[href]');
+            // Filter to only those matching included path patterns
+            includedLinks = allLinks.filter(link => {
+                const linkHref = (link.dataset.downloadurl && link.dataset.downloadurl.includes('wpdmdl='))
+                    ? link.dataset.downloadurl
+                    : link.href;
+                return window.DocAccess.isUrlIncluded && window.DocAccess.isUrlIncluded(linkHref);
+            });
+        }
+
+        // Merge both sets of links, removing duplicates
+        const allPdfLinks = [...new Set([...pdfLinks, ...includedLinks])];
+
+        // Convert to Array if needed (already an array from our helper)
+        const linksArray = Array.from(allPdfLinks);
+
+        // Performance tracking for large link sets
+        const totalLinks = linksArray.length;
+        let processedLinks = 0;
+
+        // If there are links to process, set the processing flag
+        if (totalLinks > 0) {
+            window.DocAccess.isBatchProcessing = true;
+        } else {
+            // No links to process, ensure flag is cleared
+            return;
+        }
+
+        // Process links in batches to avoid blocking the main thread
+        const BATCH_SIZE = window.DocAccess.config.batchSize || 10;
+        const PROCESSING_DELAY = window.DocAccess.config.processingDelay || 0;
+        let currentIndex = 0;
+        let isPaused = false;
+        let pendingBatch = null;
+
+        // Pause/resume based on page visibility
+        function handleVisibilityChange() {
+            if (document.hidden) {
+                isPaused = true;
+            } else {
+                isPaused = false;
+                // Resume processing if there's a pending batch
+                if (pendingBatch) {
+                    pendingBatch();
+                    pendingBatch = null;
+                }
+            }
+        }
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+
+        function processBatch() {
+            const endIndex = Math.min(currentIndex + BATCH_SIZE, linksArray.length);
+
+            for (let i = currentIndex; i < endIndex; i++) {
+                let link = linksArray[i];
+
+                // Prevent double initialization — but allow reprocessing if the
+                // page's client-side JS changed the link's href since we last saw it
+                // (e.g., Diligent One Platform replaces placeholder hrefs after render)
+                if (window.DocAccess.processedLinks.has(link)) {
+                    if (window.DocAccess.processedLinks.get(link) === link.href) {
+                        processedLinks++;
+                        continue;
+                    }
+                    // href changed — strip stale attributes so the link gets fresh processing
+                    link.removeAttribute('data-docaccess-source-url');
+                    link.removeAttribute('data-url-hash');
+                    link.removeAttribute('data-url-status');
+                    link.classList.remove('docaccess-activated');
+                }
+
+                // Skip disabled links
+                if (link.classList.contains('docbox-disabled')) {
+                    continue;
+                }
+
+                // Skip links with the no-docbox class
+                if (link.classList.contains('no-docbox')) {
+                    continue;
+                }
+
+                // Check if link matches excluded path patterns
+                const linkHref = (link.dataset.downloadurl && link.dataset.downloadurl.includes('wpdmdl='))
+                    ? link.dataset.downloadurl
+                    : link.href;
+                const hasDocboxDirectClass = link.classList.contains('docbox-direct');
+                if (window.DocAccess.isUrlExcluded && window.DocAccess.isUrlExcluded(linkHref)) {
+                    if (hasDocboxDirectClass) {
+                        link.classList.remove('docbox-excluded');
+                    } else {
+                        link.classList.add('docbox-excluded');
+                        continue;
+                    }
+                }
+
+                // Skip links with id starting with body_file- and matching body_file-[UUID] pattern
+                // that are in a wysiwym-flow-content-element
+                if (link.id && link.id.length === 46 && link.id.startsWith('body_file-')) {
+                    // Skip if any of the five ancestors have class 'wysiwym-flow-content-element'
+                    let ancestor = link.parentNode, skip = false;
+                    for (let i = 0; i < 5 && ancestor; i++, ancestor = ancestor.parentNode)
+                        if (ancestor.classList?.contains('wysiwym-flow-content-element')) { skip = true; break; }
+                    if (skip) continue;
+                }
+
+                // Skip links inside contenteditable areas (WYSIWYG editors)
+                // This prevents DA from modifying links while a CMS editor is active
+                // (e.g., Blackboard/SchoolWires reContentArea, TinyMCE, CKEditor inline)
+                // without blanket-excluding entire CMS portlet containers
+                var editableAncestor = link.parentNode;
+                var skipEditable = false;
+                while (editableAncestor && editableAncestor !== document.body) {
+                    if (editableAncestor.getAttribute && editableAncestor.getAttribute('contenteditable') === 'true') {
+                        skipEditable = true;
+                        break;
+                    }
+                    editableAncestor = editableAncestor.parentNode;
+                }
+                if (skipEditable) continue;
+
+                // Quick early exit for common non-PDF patterns
+                const href = (link.dataset.downloadurl && link.dataset.downloadurl.includes('wpdmdl='))
+                    ? link.dataset.downloadurl
+                    : link.href;
+                // docbox-enable-viewer links skip the docviewer.html check (used for pre-built viewer URLs)
+                const isViewerLink = link.classList.contains('docbox-enable-viewer');
+                if (href.includes('javascript:') ||
+                    href.includes('mailto:') ||
+                    href.includes('tel:') ||
+                    href.includes('plainText=true') || href.includes('plainText%3Dtrue') ||
+                    href.includes('?html=true') ||
+                    href.includes('&html=true') ||
+                    href.includes('media=true') ||
+                    (!isViewerLink && href.includes('/docviewer.html')) ||
+                    href === '' ||
+                    href === window.location.href) {
+                    continue;
+                }
+
+                // Skip hash-based SPA routes
+                try {
+                    const linkUrl = new URL(href);
+                    // Skip any hash that looks like a route (starts with #/, #!, or contains path-like structure)
+                    if (linkUrl.hash && (
+                        linkUrl.hash.startsWith('#/') ||
+                        linkUrl.hash.startsWith('#!/') ||
+                        linkUrl.hash.includes('/assets/') ||
+                        linkUrl.hash.includes('/admin/') ||
+                        linkUrl.hash.includes('/app/') ||
+                        linkUrl.hash.includes('/files/') ||
+                        linkUrl.hash.includes('/documents/')
+                    )) {
+                        continue;
+                    }
+                } catch (e) {
+                    // If URL parsing fails, continue processing (let later code handle it)
+                }
+
+                // Mark link as being processed BEFORE async work to prevent reprocessing
+                // This is critical because the async function takes time and mutations can trigger during it
+                link.classList.add('docaccess-activated');
+                processedLinks++;
+
+                // Snapshot the href synchronously before any await, so we can detect
+                // if the page's JS changes it between now and when we write attributes
+                const hrefAtCapture = link.href;
+
+                // Process the link asynchronously
+                (async () => {
+                    // Prefer developer-provided data-docaccess-source-url (custom app integration),
+                    // then data-downloadurl for WordPress Download Manager, then href
+                    const linkUrl = link.dataset.docaccessSourceUrl ||
+                        (link.dataset.downloadurl && link.dataset.downloadurl.includes('wpdmdl=')
+                            ? link.dataset.downloadurl
+                            : hrefAtCapture);
+
+                    // Clean tracking parameters from the link URL
+                    const cleanedHref = window.DocAccess.cleanTrackingParams(linkUrl);
+
+                    // Normalize URL with manifest data (manifest is always loaded at this point)
+                    const normalizedHref = await window.DocAccess.normalizeUrlWithManifestCheck(cleanedHref);
+
+                    // Store for other scripts to use (e.g., docbox-overlay.js)
+                    link.setAttribute('data-docaccess-source-url', normalizedHref);
+
+                    // Mark as processed with this href so we can detect changes later
+                    window.DocAccess.processedLinks.set(link, hrefAtCapture);
+
+                    const hash = await window.DocAccess.generateSHA256(normalizedHref);
+
+                    // Check if link still exists in DOM
+                    if (!link || !link.parentNode) {
+                        return;
+                    }
+
+                    // Resolve any redirects and store the final destination hash
+                    const resolvedHash = window.DocAccess.resolveSymlinkHash(hash);
+
+                    // For docbox-enable links (from control center), preserve the provided url_hash
+                    // if one was already set. This is important for private documents where the
+                    // stored hash differs from SHA256(url).
+                    const existingHash = link.dataset.urlHash;
+                    if (!existingHash || !link.classList.contains('docbox-enable')) {
+                        link.dataset.urlHash = resolvedHash;
+                    }
+
+                    // Determine URL status using shared helper
+                    const hasForceEnableClass = link.classList.contains('docbox-direct') ||
+                        link.classList.contains('docbox-enable') ||
+                        link.classList.contains('docbox-enable-viewer');
+                    const urlStatus = window.DocAccess.getUrlStatus(hash, hasForceEnableClass);
+                    link.dataset.urlStatus = urlStatus;
+
+                    // Handle non-enabled statuses
+                    if (urlStatus === 'archived' || urlStatus === 'disabled' || urlStatus === 'processing') {
+                        // These statuses don't get click handlers
+                        return;
+                    }
+
+                    if (urlStatus === 'new') {
+                        const domainToSend = window.DocAccess.primaryDomain || window.DocAccess.currentDomain;
+                        // TODO: Re-enable blob signed URL once url_hash orphan fix is deployed
+                        // const blobSignedUrl = (linkUrl !== normalizedHref && linkUrl.includes('.blob.core.windows.net/'))
+                        //     ? linkUrl : undefined;
+                        sendDomainLink(domainToSend, normalizedHref);
+                        return;
+                    }
+
+                    // If viewer is disabled (paused mode), don't attach click handler
+                    // Links are still discovered and sent to API, but viewer won't open
+                    if (window.DocAccess.viewerDisabled === true) {
+                        return;
+                    }
+
+                    // Additional check before DOM manipulation
+                    if (!link.parentNode) {
+                        return;
+                    }
+
+                    // Remove any existing event listeners by replacing with a clone.
+                    // Skip for links inside MUI menus (role="menuitem") where cloning
+                    // would sever the framework's roving tabindex keyboard listeners.
+                    if (!link.getAttribute('role') || link.getAttribute('role') !== 'menuitem') {
+                        try {
+                            const oldLink = link.cloneNode(true);
+                            link.parentNode.replaceChild(oldLink, link);
+                            link = oldLink;
+                        } catch (error) {
+                            console.error('DocBox: Error during link replacement:', error, 'Link:', link.href);
+                            // Continue anyway - try to attach listener to original link
+                        }
+                    }
+
+                    link.addEventListener('click', async function (e) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        e.stopImmediatePropagation(); // Prevent other listeners on same element
+
+                        // If open_in_new_tab is enabled, build docviewer URL and open in new tab.
+                        // IMPORTANT: this must be synchronous (before any await) to avoid popup blockers.
+                        if (window.DocAccess.openInNewTab) {
+                            const linkUrl = this.dataset.docaccessSourceUrl ||
+                                ((this.dataset.downloadurl && this.dataset.downloadurl.includes('wpdmdl='))
+                                    ? this.dataset.downloadurl
+                                    : this.href);
+                            const cleanUrl = window.DocAccess.cleanTrackingParams(linkUrl);
+
+                            const viewerUrl = buildDocviewerUrl(cleanUrl, {
+                                base: resolveScriptRoot(),
+                                urlHash: this.dataset.urlHash || null,
+                                domain: this.dataset.docaccessDomain ||
+                                    window.DocAccess.primaryDomain || window.DocAccess.currentDomain
+                            });
+
+                            window.open(viewerUrl, '_blank', 'noopener');
+                            return false;
+                        }
+
+                        // Store reference to this link
+                        window.DocAccess.lastActivatedLink = this;
+
+                        // Prevent target="_blank" behavior
+                        if (this.target === '_blank') {
+                            this.target = '';
+                        }
+
+                        // Prefer data-docaccess-source-url (normalized URL), then data-downloadurl for WordPress, then href
+                        const linkUrl = this.dataset.docaccessSourceUrl ||
+                            ((this.dataset.downloadurl && this.dataset.downloadurl.includes('wpdmdl='))
+                                ? this.dataset.downloadurl
+                                : this.href);
+
+                        // Clean the URL again when opening
+                        const cleanUrl = window.DocAccess.cleanTrackingParams(linkUrl);
+
+                        // Use the new async normalization function
+                        const normalizedUrl = await window.DocAccess.normalizeUrlWithManifestCheck(cleanUrl);
+
+                        // Get provided hash if available (from control center)
+                        const providedHash = this.dataset.urlHash || null;
+
+                        // docbox-direct and docbox-enable-viewer links use href directly (no wrapping in docviewer.html)
+                        const useDirectUrl = this.classList.contains('docbox-direct') || this.classList.contains('docbox-enable-viewer');
+                        if (this.dataset.docaccessDomain) {
+                            openLightbox(normalizedUrl, useDirectUrl, this.dataset.docaccessDomain, this, null, providedHash);
+                        } else {
+                            openLightbox(normalizedUrl, useDirectUrl, '', this, null, providedHash);
+                        }
+
+                        return false;
+                    }, { capture: true }); // Use capture phase to run before other event listeners
+                    link.removeAttribute('target');
+
+                    // Mark that listener was successfully attached, storing the href
+                    // so we can detect if the page's JS changes it later
+                    window.DocAccess.processedLinks.set(link, hrefAtCapture);
+                })().catch(error => {
+                    console.error('DocBox: Error processing link',
+                        (link.dataset.downloadurl && link.dataset.downloadurl.includes('wpdmdl='))
+                            ? link.dataset.downloadurl
+                            : link.href,
+                        error);
+                });
+            }
+
+            currentIndex = endIndex;
+
+            // Schedule next batch if there are more links
+            if (currentIndex < linksArray.length) {
+                // Check if processing should be paused
+                if (isPaused || document.hidden) {
+                    // Store the next batch to run when page becomes visible
+                    pendingBatch = processBatch;
+                    return;
+                }
+
+                if (typeof requestIdleCallback !== 'undefined') {
+                    if (PROCESSING_DELAY > 0) {
+                        setTimeout(() => requestIdleCallback(processBatch), PROCESSING_DELAY);
+                    } else {
+                        requestIdleCallback(processBatch);
+                    }
+                } else {
+                    setTimeout(processBatch, PROCESSING_DELAY);
+                }
+            } else {
+                // Processing complete - clean up visibility listener and reset processing flag
+                document.removeEventListener('visibilitychange', handleVisibilityChange);
+                window.DocAccess.isBatchProcessing = false;
+            }
+        }
+
+        // Start processing
+        processBatch();
+    }
+
+    async function sendDomainLink(domain, hrefRaw, signedUrl) {
+        // Skip if external API calls are disabled
+        if (window.DocAccess.config && window.DocAccess.config.disableExternalAPIs === true) {
+            return;
+        }
+
+        // Don't send links if domain data failed to load - we can't verify this is an authorized domain
+        if (!window.DocAccess.domainDataLoaded) {
+            return;
+        }
+
+        // Initialize the Set if it doesn't exist
+        if (!sendDomainLink.sentLinks) {
+            sendDomainLink.sentLinks = new Set();
+        }
+
+        // Clean HubSpot parameters before processing
+        const cleanedHref = window.DocAccess.cleanTrackingParams(hrefRaw);
+
+        // Use the new async normalization function
+        const normalizedHref = await window.DocAccess.normalizeUrlWithManifestCheck(cleanedHref);
+
+        const domainName = domain.replace(/^www\./, '').replace(/[^a-zA-Z0-9.-]/g, '').toLowerCase();
+        if (!domainName || !normalizedHref) return;
+
+        let url;
+        try {
+            url = new URL(normalizedHref);
+        } catch (e) {
+            console.error('DocBox: Error parsing URL for domain_links', normalizedHref, e);
+            return;
+        }
+
+        //Keeps the input reasonable, but might miss some links
+        //if (!url.href.includes('.pdf')) return;
+
+        //don't send docviewer links or form submissions or AWS signed URLs
+        if (url.pathname.startsWith('/docviewer')) return;
+        if (url.hostname.startsWith('streamline-form-submissions')) return;
+        // Block submissions when on docaccess.com domain (no exceptions)
+        if (domain.endsWith('docaccess.com')) return;
+        // Also block docaccess.com URLs UNLESS they're from /uploads/ directory
+        if (url.hostname.endsWith('docaccess.com') && !url.pathname.startsWith('/uploads/')) return;
+        if (url.href.includes('DO-NOT-COPY-THIS-URL')) return;
+
+        // Don't send HTML pages (html=true parameter indicates HTML content, not PDF)
+        if (url.searchParams.has('html') && url.searchParams.get('html') === 'true') return;
+
+        // Prevent crawl loops: detect and reject URLs that show loop patterns
+        // PHP front controllers (like washoecounty.gov) return HTML for any path,
+        // causing relative links to accumulate: /index.php/2022/files/2023/files/...
+        // Detect loop patterns in path
+        const path = url.pathname;
+        // Deep path after .php (more than 6 segments = likely a loop)
+        if (/\.php\/[^\/]+\/[^\/]+\/[^\/]+\/[^\/]+\/[^\/]+\/[^\/]+\//.test(path)) return;
+        // Repeated year patterns (2020/.../2021/.../2022/...)
+        if (/\/20\d{2}\/.*\/20\d{2}\/.*\/20\d{2}\//.test(path)) return;
+        // Repeated /files/ segments
+        if (/\/files\/.*\/files\/.*\/files\//.test(path)) return;
+
+        // Don't send admin/edit/delete paths
+        if (url.pathname.match(/\/media\/[^/]+\/(delete|edit)/i)) return;
+        if (url.pathname.match(/\/node\/[^/]+\/(delete|edit)/i)) return;
+
+        // Don't submit URLs matching excluded path patterns
+        if (window.DocAccess.isUrlExcluded && window.DocAccess.isUrlExcluded(normalizedHref)) {
+            return;
+        }
+
+        // Don't send hash-based routes or fragment-only URLs (SPA routes)
+        if (url.hash && (
+            url.hash.startsWith('#/') ||
+            url.hash.startsWith('#!/') ||
+            url.hash.includes('/assets/') ||
+            url.hash.includes('/admin/') ||
+            url.hash.includes('/app/') ||
+            url.hash.includes('/files/') ||
+            url.hash.includes('/documents/')
+        )) return;
+
+        // Check if this link has already been sent (using normalized URL)
+        if (sendDomainLink.sentLinks && sendDomainLink.sentLinks.has(normalizedHref)) {
+            return;
+        }
+
+        // Don't send links that are inside Angular Traction dock elements
+        try {
+            // Escape the href value to handle special characters in the selector
+            const escapedHref = CSS.escape ? CSS.escape(normalizedHref) : normalizedHref.replace(/[!"#$%&'()*+,.\/:;<=>?@[\\\]^`{|}~]/g, '\\$&');
+            const linkElement = document.querySelector(`a[href="${escapedHref}"]`);
+            if (linkElement) {
+                const tractionDock = linkElement.closest('body[ng-app="traction"] .dock');
+                if (tractionDock) {
+                    return;
+                }
+            }
+        } catch (e) {
+            // If querySelector fails, continue with sending the link
+            //console.warn('DocBox: Error checking for Angular Traction dock element', e);
+        }
+
+        // Add this link to the sent links Set
+        sendDomainLink.sentLinks.add(normalizedHref);
+
+        // Get current page URL and clean it
+        let foundOnUrl = window.location.href;
+
+        // Remove anchors and clean tracking parameters
+        const urlParts = foundOnUrl.split('#');
+        foundOnUrl = urlParts[0]; // Remove everything after #
+        foundOnUrl = window.DocAccess.cleanTrackingParams(foundOnUrl);
+
+        // Determine the API endpoint and payload based on configuration
+        let apiUrl, requestBody;
+
+        if (window.DocAccess.USE_LEGACY_API) {
+            // Legacy API endpoint
+            apiUrl = 'https://admin.docaccess.com/api/v1/domain_link';
+            requestBody = {
+                domain: domainName,
+                url: normalizedHref
+            };
+        } else {
+            // New API endpoint
+            // Detect the script domain to use the same subdomain for API calls
+            let apiHost;
+            if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+                apiHost = 'http://localhost:9000';
+            } else {
+                // Try to detect the domain from the script source
+                const scripts = document.getElementsByTagName('script');
+                let scriptDomain = '';
+                for (let i = 0; i < scripts.length; i++) {
+                    if (scripts[i].src && scripts[i].src.match(/docbox\.js(\?.*)?$/)) {
+                        try {
+                            const url = new URL(scripts[i].src);
+                            scriptDomain = url.hostname;
+                            break;
+                        } catch (e) {
+                            // Continue trying other scripts
+                        }
+                    }
+                }
+                // Use the detected script domain, or fall back to docaccess.com
+                apiHost = scriptDomain && scriptDomain.endsWith('docaccess.com')
+                    ? `https://${scriptDomain}`
+                    : 'https://docaccess.com';
+            }
+            apiUrl = `${apiHost}/api/doc-link`;
+            requestBody = {
+                doc_url: normalizedHref,
+                found_on: foundOnUrl
+            };
+            if (signedUrl) {
+                requestBody.signed_url = signedUrl;
+            }
+        }
+
+        fetch(apiUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(requestBody)
+        }).catch(error => {
+            console.error('DocBox: Error sending document link', normalizedHref, foundOnUrl, error);
+        });
+    }
+
+    // Expose sendDomainLink function for external modules
+    window.DocAccess.sendDomainLink = sendDomainLink;
+
+    // Expose loadCivicClerkIntegration for initDocBox to call after successful domain.json fetch
+    window.DocAccess.loadCivicClerkIntegration = loadCivicClerkIntegration;
+
+    // Function to conditionally load CivicClerk integration
+    function loadCivicClerkIntegration() {
+        // Check if CivicClerk is present via:
+        // 1. Already detected and authorized (clerkEmbedProps set by initDocBox after successful domain.json fetch)
+        // 2. Embedded widget with clerkEmbedProps (set by the hosting page before docbox.js loads)
+        // 3. Manifest-specified tenant (from domain.json)
+        //
+        // Note: Native CivicClerk portals are NOT auto-loaded here - they require
+        // a registered domain.json to enable DocAccess features (translate button, accessible PDFs)
+        let tenantId = null;
+
+        // Check for native CivicClerk portal URL - these require registration
+        // Note: tenant can include dots for subdomains (e.g., devtest.qa.portal.civicclerk.com)
+        const hostname = window.location.hostname.toLowerCase();
+        const isNativePortal = /^[a-z0-9.-]+\.portal\.civicclerk\.com$/.test(hostname);
+
+        if (isNativePortal) {
+            // Native portals: only load if already authorized by initDocBox
+            if (window.clerkEmbedProps && window.clerkEmbedProps.tenant && window.DocAccess.domainDataLoaded) {
+                tenantId = window.clerkEmbedProps.tenant;
+            } else {
+                // Not authorized yet - initDocBox will call this again after successful fetch
+                return;
+            }
+        } else if (window.clerkEmbedProps && window.clerkEmbedProps.tenant) {
+            // Embedded widget - tenant was set by the hosting page
+            tenantId = window.clerkEmbedProps.tenant;
+        } else if (window.DocAccess.civicclerkTenant) {
+            // Auto-detected from customer's domains (in manifest)
+            tenantId = window.DocAccess.civicclerkTenant;
+            window.DocAccess._log('Using CivicClerk tenant from manifest:', tenantId);
+            // Store for the CivicClerk integration script
+            window.clerkEmbedProps = window.clerkEmbedProps || {};
+            window.clerkEmbedProps.tenant = tenantId;
+        }
+
+        if (!tenantId) {
+            return;
+        }
+
+        // Create script tag to load civicclerk.js
+        const script = document.createElement('script');
+
+        // Use same domain as docbox.js was loaded from
+        let scriptSrc = '';
+        const currentScript = document.currentScript || (function () {
+            const scripts = document.getElementsByTagName('script');
+            for (let i = 0; i < scripts.length; i++) {
+                if (scripts[i].src && scripts[i].src.match(/docbox\.js(\?.*)?$/)) {
+                    return scripts[i];
+                }
+            }
+            return null;
+        })();
+
+        if (currentScript && currentScript.src) {
+            const url = new URL(currentScript.src);
+            scriptSrc = url.origin + '/docbox-civicclerk.js';
+        } else {
+            // Default to docaccess.com
+            scriptSrc = 'https://docaccess.com/docbox-civicclerk.js';
+        }
+
+
+
+        script.src = scriptSrc;
+        script.async = true;
+        script.onload = function () {
+            window.DocAccess._log('CivicClerk integration loaded successfully');
+        };
+        script.onerror = function () {
+            console.error('DocAccess: Failed to load CivicClerk integration');
+        };
+
+        document.head.appendChild(script);
+    }
+
+    // Function to conditionally load Laserfiche WebLink integration
+    function loadLaserficheIntegration() {
+        // Check if we're on a Laserfiche WebLink page
+        const isLaserfichePage = (
+            // Check URL path for WebLink patterns
+            /\/WebLink\/(DocView|Browse|ElectronicFile)\.aspx/i.test(window.location.pathname) ||
+            // Check for Laserfiche branding in page
+            document.querySelector('img[alt*="Laserfiche"], img[alt*="WebLink"]')
+        );
+
+        if (!isLaserfichePage) {
+            return;
+        }
+
+        window.DocAccess._log('Laserfiche WebLink detected, loading integration');
+
+        // Create script tag to load docbox-laserfiche.js
+        const script = document.createElement('script');
+
+        // Use same domain as docbox.js was loaded from
+        let scriptSrc = '';
+        const currentScript = document.currentScript || (function () {
+            const scripts = document.getElementsByTagName('script');
+            for (let i = 0; i < scripts.length; i++) {
+                if (scripts[i].src && scripts[i].src.match(/docbox\.js(\?.*)?$/)) {
+                    return scripts[i];
+                }
+            }
+            return null;
+        })();
+
+        if (currentScript && currentScript.src) {
+            const url = new URL(currentScript.src);
+            scriptSrc = url.origin + '/docbox-laserfiche.js';
+        } else {
+            // Default to docaccess.com
+            scriptSrc = 'https://docaccess.com/docbox-laserfiche.js';
+        }
+
+        script.src = scriptSrc;
+        script.async = true;
+        script.onload = function () {
+            window.DocAccess._log('Laserfiche integration loaded successfully');
+        };
+        script.onerror = function () {
+            console.error('DocAccess: Failed to load Laserfiche integration');
+        };
+
+        document.head.appendChild(script);
+    }
+
+    // Expose loadLaserficheIntegration for external use
+    window.DocAccess.loadLaserficheIntegration = loadLaserficheIntegration;
+
+    // Initialize when the DOM is ready
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function () {
+            // Ensure current page has a state object
+            if (!window.history.state || !window.history.state.docaccessInit) {
+                window.history.replaceState({
+                    docaccessInit: true,
+                    pageUrl: window.location.href,
+                    timestamp: Date.now()
+                }, '', window.location.href);
+            }
+
+            initPdfLinks();
+            // Check if there's a docaccess hash on initial load
+            checkInitialHash();
+            // Load CivicClerk integration if present
+            loadCivicClerkIntegration();
+            // Load Laserfiche integration if present
+            loadLaserficheIntegration();
+        });
+    } else {
+        // Ensure current page has a state object
+        if (!window.history.state || !window.history.state.docaccessInit) {
+            window.history.replaceState({
+                docaccessInit: true,
+                pageUrl: window.location.href,
+                timestamp: Date.now()
+            }, '', window.location.href);
+        }
+
+        initPdfLinks();
+        // Check if there's a docaccess hash on initial load
+        checkInitialHash();
+        // Load CivicClerk integration if present
+        loadCivicClerkIntegration();
+        // Load Laserfiche integration if present
+        loadLaserficheIntegration();
+    }
+
+    // Function to check for docaccess hash on initial page load
+    async function checkInitialHash() {
+        const currentHash = window.location.hash;
+        if (currentHash.startsWith('#docaccess-')) {
+            // Extract the document hash
+            const docHash = currentHash.substring('#docaccess-'.length);
+
+            // Store the hash for later use
+            window.DocAccess.pendingDocHash = docHash;
+
+            // Wait for domain data to load
+            if (!window.DocAccess.domainDataLoaded) {
+                // Domain data not loaded yet, wait for it
+                const checkInterval = setInterval(() => {
+                    if (window.DocAccess.domainDataLoaded) {
+                        clearInterval(checkInterval);
+                        openDocumentFromHash(docHash);
+                    }
+                }, 100);
+
+                // Timeout after 10 seconds
+                setTimeout(() => {
+                    clearInterval(checkInterval);
+                    if (!window.DocAccess.domainDataLoaded) {
+                        window.DocAccess._log('Timeout waiting for domain data');
+                    }
+                }, 10000);
+            } else {
+                // Domain data already loaded
+                openDocumentFromHash(docHash);
+            }
+        }
+    }
+
+    // Helper function to open document from hash
+    async function openDocumentFromHash(docHash) {
+        // Helper function to check if a hash is enabled (handles symlinks)
+        function isDocHashEnabled(hash) {
+            if (!window.DocAccess.domainDocumentLinkData || !window.DocAccess.domainDocumentLinkData.hasOwnProperty(hash)) {
+                return false;
+            }
+
+            const value = window.DocAccess.domainDocumentLinkData[hash];
+
+            if (value === true || value === 'deferred') {
+                return true;
+            }
+
+            if (value === 'archived') {
+                return false;
+            }
+
+            if (typeof value === 'string') {
+                const resolved = window.DocAccess.resolveSymlinkValue(hash);
+                return resolved === true || resolved === 'deferred';
+            }
+
+            return false;
+        }
+
+        // If the hash is in the manifest, wait for link activation to complete
+        // rather than scanning raw links (which can't resolve manifest symlinks).
+        if (window.DocAccess.domainDocumentLinkData && isDocHashEnabled(docHash)) {
+            const findActivatedLink = () => {
+                const allLinks = collectLinksFromDocument(document, 'a[data-url-hash="' + docHash + '"]');
+                if (allLinks.length > 0 && allLinks[0].classList.contains('docaccess-activated')) {
+                    return allLinks[0];
+                }
+                return null;
+            };
+
+            const link = findActivatedLink();
+            if (link) {
+                link.click();
+                return;
+            }
+
+            // Link not activated yet — poll until link activation completes
+            return new Promise((resolve) => {
+                let elapsed = 0;
+                const interval = setInterval(() => {
+                    elapsed += 100;
+                    const link = findActivatedLink();
+                    if (link) {
+                        clearInterval(interval);
+                        link.click();
+                        resolve();
+                        return;
+                    }
+                    if (elapsed >= 10000) {
+                        clearInterval(interval);
+                        window.DocAccess._log('Timeout waiting for link activation for hash', docHash);
+                        resolve();
+                    }
+                }, 100);
+            });
+        }
+
+        // Hash not in manifest — log for debugging, leave page as-is
+        window.DocAccess._log('Hash fragment #docaccess-' + docHash + ' does not match any known active enabled document. Viewer will not open.');
+    }
+
+    // Track whether DOM mutations have occurred
+    let mutationHasOccurred = false;
+
+    // Same-origin agenda/content iframes (e.g. Diligent split-screen #agenda-frame) load
+    // their documents after our first initPdfLinks pass; subtree mutations on the parent
+    // do not include those inner updates. Re-run link discovery when any iframe fires load.
+    const iframeLoadWired = new WeakSet();
+
+    function wireIframeLoadForRescan(iframe) {
+        if (!iframe || iframe.nodeType !== 1 || iframe.tagName !== 'IFRAME' || iframeLoadWired.has(iframe)) {
+            return;
+        }
+        iframeLoadWired.add(iframe);
+        iframe.addEventListener('load', function () {
+            mutationHasOccurred = true;
+        });
+    }
+
+    function wireIframesInSubtree(root) {
+        if (!root || root.nodeType !== 1) {
+            return;
+        }
+        if (root.tagName === 'IFRAME') {
+            wireIframeLoadForRescan(root);
+        }
+        if (root.querySelectorAll) {
+            root.querySelectorAll('iframe').forEach(wireIframeLoadForRescan);
+        }
+    }
+
+    // Create a MutationObserver to detect DOM changes
+    const observer = new MutationObserver(function (mutations) {
+        mutationHasOccurred = true;
+        mutations.forEach(function (m) {
+            m.addedNodes.forEach(wireIframesInSubtree);
+        });
+    });
+
+    // Start observing the document body for changes
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+
+    document.querySelectorAll('iframe').forEach(wireIframeLoadForRescan);
+
+    // Function to replace Google Drive embedded iframes with DocAccess widget
+    function replaceGoogleDriveIframes() {
+        // Find all Google Drive embedded folder iframes
+        const googleDriveIframes = document.querySelectorAll('iframe[src*="drive.google.com/embeddedfolderview"]');
+
+        // Track instance counter for multiple iframes with the same folder
+        window.DocAccess.gdriveInstanceCounter = window.DocAccess.gdriveInstanceCounter || 0;
+
+        googleDriveIframes.forEach(iframe => {
+            // Skip if already replaced
+            if (iframe.hasAttribute('data-docaccess-replaced')) {
+                return;
+            }
+
+            // Check retry count - max 2 retries
+            const retryCount = parseInt(iframe.getAttribute('data-docaccess-retry-count') || '0');
+            if (retryCount >= 2) {
+                return;
+            }
+
+            try {
+                const src = iframe.src;
+                const url = new URL(src);
+
+                // Extract folder/file ID from the URL
+                let folderId = null;
+
+                // Google Drive URL handling
+                const idMatch = url.searchParams.get('id');
+                if (idMatch) {
+                    folderId = idMatch;
+                } else {
+                    // Try to extract from path if not in query params
+                    const pathMatch = url.pathname.match(/embeddedfolderview\/([a-zA-Z0-9_-]+)/);
+                    if (pathMatch) {
+                        folderId = pathMatch[1];
+                    }
+                }
+
+                if (folderId) {
+                    // Generate a unique container ID with instance counter (up to 10 instances)
+                    const instanceNum = window.DocAccess.gdriveInstanceCounter;
+                    if (instanceNum >= 10) {
+                        return;
+                    }
+                    window.DocAccess.gdriveInstanceCounter++;
+
+                    const containerId = 'docaccess-gdrive-' + folderId.substring(0, 8).toLowerCase() + '-' + instanceNum;
+
+                    // Create a container div to replace the iframe
+                    const container = document.createElement('div');
+                    container.className = 'docaccess-gdrive-replacement';
+
+                    // Create the inner container with the expected ID
+                    const innerContainer = document.createElement('div');
+                    innerContainer.id = containerId;
+                    container.appendChild(innerContainer);
+
+                    // Copy any styling from the iframe
+                    if (iframe.style.width) container.style.width = iframe.style.width;
+                    // Don't copy height - let it flow freely
+                    // if (iframe.style.height) container.style.height = iframe.style.height;
+                    if (iframe.style.border) container.style.border = iframe.style.border;
+
+                    // Mark iframe as replaced and increment retry count
+                    iframe.setAttribute('data-docaccess-replaced', 'true');
+                    iframe.setAttribute('data-docaccess-retry-count', String(retryCount + 1));
+
+                    // Insert our container after the iframe (don't hide the iframe yet)
+                    iframe.parentNode.insertBefore(container, iframe.nextSibling);
+
+                    // Create and configure the script element
+                    const script = document.createElement('script');
+
+                    // Check if the current page has an apiKey parameter
+                    const pageParams = new URLSearchParams(window.location.search);
+                    const apiKey = pageParams.get('apiKey');
+
+                    // Use same origin as docbox.js was loaded from
+                    let apiOrigin = 'https://docaccess.com';
+                    if (window.DocAccess.scriptOrigin) {
+                        apiOrigin = window.DocAccess.scriptOrigin;
+                    }
+
+                    let scriptSrc = `${apiOrigin}/api/google-drive?url=${encodeURIComponent(src)}&instance=${instanceNum}`;
+                    if (apiKey) {
+                        scriptSrc += `&apiKey=${encodeURIComponent(apiKey)}`;
+                    }
+
+                    script.src = scriptSrc;
+                    script.setAttribute('data-container-id', containerId);
+
+                    // Append the script to load the widget
+                    getLightboxContainer().appendChild(script);
+
+                }
+            } catch (e) {
+                // Silent fail - leave original iframe in place
+            }
+        });
+    }
+
+    // Run the Google Drive iframe replacement initially
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', replaceGoogleDriveIframes);
+    } else {
+        // DOM already loaded, run immediately
+        setTimeout(replaceGoogleDriveIframes, 100);
+    }
+
+    // ========================================================================
+    // ONCLICK PDF LINK DISCOVERY
+    // Scans for elements with onclick attributes that open PDFs via window.open
+    // or location changes, and processes them like regular anchor links.
+    // ========================================================================
+
+    // Track processed onclick elements to avoid reprocessing
+    if (!window.DocAccess.processedOnclickElements) {
+        window.DocAccess.processedOnclickElements = new WeakSet();
+    }
+
+    /**
+     * Discover and process elements with onclick handlers that open PDF files.
+     * These are common on government sites that use table rows or other elements
+     * to open documents instead of standard anchor links.
+     * 
+     * Example patterns detected:
+     * <tr onclick="window.open('/media/file.pdf')">
+     * <div onclick="location.href='/docs/document.pdf'">
+     */
+    function discoverOnclickPdfLinks() {
+        // Don't process until domain data is loaded
+        if (!window.DocAccess.domainDataLoaded) {
+            return;
+        }
+
+        // Patterns to extract PDF URLs from onclick attributes
+        // We focus on .pdf URLs to be conservative and avoid false positives
+        const urlExtractionPatterns = [
+            // window.open with PDF URL
+            /window\.open\s*\(\s*["']([^"']*\.pdf[^"']*)["']/gi,
+            // location.href assignment with PDF URL  
+            /location(?:\.href)?\s*=\s*["']([^"']*\.pdf[^"']*)["']/gi,
+            // location.assign/replace with PDF URL
+            /location\.(?:assign|replace)\s*\(\s*["']([^"']*\.pdf[^"']*)["']/gi
+        ];
+
+        // Find all elements with onclick attributes containing .pdf
+        // This is a fast pre-filter before running regex extraction
+        const onclickElements = document.querySelectorAll('[onclick*=".pdf" i]');
+
+        onclickElements.forEach(element => {
+            // Skip if already processed
+            if (window.DocAccess.processedOnclickElements.has(element)) {
+                return;
+            }
+
+            // Skip anchor elements - they're handled by initPdfLinks
+            if (element.tagName === 'A') {
+                return;
+            }
+
+            const onclickAttr = element.getAttribute('onclick');
+            if (!onclickAttr) return;
+
+            // Try each pattern to extract PDF URL
+            let pdfUrl = null;
+            for (const pattern of urlExtractionPatterns) {
+                pattern.lastIndex = 0; // Reset regex state
+                const match = pattern.exec(onclickAttr);
+                if (match && match[1]) {
+                    pdfUrl = match[1];
+                    break;
+                }
+            }
+
+            if (!pdfUrl) return;
+
+            // Resolve relative URLs to absolute
+            try {
+                const resolvedUrl = new URL(pdfUrl, window.location.href).href;
+                pdfUrl = resolvedUrl;
+            } catch (e) {
+                console.warn('DocAccess: Could not resolve onclick URL:', pdfUrl);
+                return;
+            }
+
+            // Mark as processed before async work
+            window.DocAccess.processedOnclickElements.add(element);
+            element.classList.add('docaccess-onclick-activated');
+
+            // Process the discovered link asynchronously (same flow as regular links)
+            (async () => {
+                // Clean tracking parameters
+                const cleanedUrl = window.DocAccess.cleanTrackingParams(pdfUrl);
+
+                // Normalize URL with manifest data
+                const normalizedUrl = await window.DocAccess.normalizeUrlWithManifestCheck(cleanedUrl);
+
+                // Store source URL for other scripts (e.g., docbox-overlay.js)
+                element.setAttribute('data-docaccess-source-url', normalizedUrl);
+
+                // Generate hash for manifest lookup
+                const hash = await window.DocAccess.generateSHA256(normalizedUrl);
+
+                // Check if element still exists
+                if (!element.parentNode) return;
+
+                // Store the resolved hash using shared helper
+                const resolvedHash = window.DocAccess.resolveSymlinkHash(hash);
+                element.dataset.urlHash = resolvedHash;
+
+                // Determine URL status using shared helper
+                const urlStatus = window.DocAccess.getUrlStatus(hash, false);
+                element.dataset.urlStatus = urlStatus;
+
+                // Handle non-enabled statuses
+                if (urlStatus === 'archived' || urlStatus === 'disabled' || urlStatus === 'processing') {
+                    // These statuses don't get click handlers
+                    return;
+                }
+
+                if (urlStatus === 'new') {
+                    const domainToSend = window.DocAccess.primaryDomain || window.DocAccess.currentDomain;
+                    // TODO: Re-enable blob signed URL once url_hash orphan fix is deployed
+                    // const blobSignedUrl = (pdfUrl !== normalizedUrl && pdfUrl.includes('.blob.core.windows.net/'))
+                    //     ? pdfUrl : undefined;
+                    sendDomainLink(domainToSend, normalizedUrl);
+                    return;
+                }
+
+                // If viewer is disabled, don't attach click handler
+                if (window.DocAccess.viewerDisabled === true) {
+                    return;
+                }
+
+                // Attach click handler to intercept and open in DocAccess viewer
+                element.addEventListener('click', async function (e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    e.stopImmediatePropagation();
+
+                    // Store reference
+                    window.DocAccess.lastActivatedLink = this;
+
+                    // Get the source URL
+                    const sourceUrl = this.dataset.docaccessSourceUrl || normalizedUrl;
+                    const cleanUrl = window.DocAccess.cleanTrackingParams(sourceUrl);
+                    const finalUrl = await window.DocAccess.normalizeUrlWithManifestCheck(cleanUrl);
+                    const providedHash = this.dataset.urlHash || null;
+
+                    // Open in DocAccess viewer
+                    openLightbox(finalUrl, false, '', this, null, providedHash);
+
+                    return false;
+                }, { capture: true });
+
+                // Add visual indicator that this element is DocAccess-enabled
+                element.style.cursor = 'pointer';
+
+                // Mark in processedLinks as well for consistency
+                window.DocAccess.processedLinks.set(element, pdfUrl);
+
+            })().catch(error => {
+                console.error('DocAccess: Error processing onclick element:', pdfUrl, error);
+            });
+        });
+    }
+
+    // Run onclick discovery after initial PDF link processing
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function () {
+            // Delay slightly to ensure initPdfLinks runs first
+            setTimeout(discoverOnclickPdfLinks, 100);
+        });
+    } else {
+        setTimeout(discoverOnclickPdfLinks, 100);
+    }
+
+    // Check for new links and iframes every 500ms (only if mutations occurred)
+    setInterval(function () {
+        if (mutationHasOccurred && !window.DocAccess.isBatchProcessing) {
+            mutationHasOccurred = false;
+            initPdfLinks();
+            discoverOnclickPdfLinks(); // Also check for onclick PDF patterns
+            replaceGoogleDriveIframes(); // Also check for new Google Drive iframes
+        }
+    }, 500);
+
+    // Safety mechanism: Check for orphaned inert attributes periodically
+    let inertCheckInterval = setInterval(function () {
+        const lightbox = document.getElementById('docbox-overlay');
+
+        // Only run cleanup if lightbox is not visible
+        if (!lightbox || lightbox.style.display === 'none' || lightbox.style.display === '') {
+            const orphanedInertElements = document.querySelectorAll('body > [inert]:not(#docbox-overlay)');
+
+            if (orphanedInertElements.length > 0) {
+                console.warn(`DocBox: Found ${orphanedInertElements.length} orphaned inert elements, cleaning up...`);
+
+                orphanedInertElements.forEach(element => {
+                    // Only remove if it wasn't originally inert
+                    if (!element.dataset.docboxOriginalInert) {
+                        element.removeAttribute('inert');
+                        element.removeAttribute('aria-hidden');
+
+                        // Restore focusable elements if we added the polyfill
+                        const modifiedElements = element.querySelectorAll('[data-docbox-original-tabindex]');
+                        modifiedElements.forEach(el => {
+                            el.setAttribute('tabindex', el.dataset.docboxOriginalTabindex);
+                            delete el.dataset.docboxOriginalTabindex;
+                        });
+
+                        const tabindexElements = element.querySelectorAll('[tabindex="-1"]:not([data-docbox-original-tabindex])');
+                        tabindexElements.forEach(el => {
+                            el.removeAttribute('tabindex');
+                        });
+                    }
+                });
+            }
+        }
+    }, 5000); // Check every 5 seconds
+
+    // Clear the interval if the page is being unloaded
+    window.addEventListener('beforeunload', function () {
+        if (inertCheckInterval) {
+            clearInterval(inertCheckInterval);
+        }
+    });
+
+    // Update the global DocBox API with real implementations
+    window.DocBox.init = initPdfLinks;
+    window.DocBox.open = openLightbox;
+    window.DocBox.close = function () { closeLightbox(true); };
+
+    // Update the namespaced alias as well
+    window.DocAccess.DocBox = window.DocBox;
+
+    // Process any queued calls that happened before initialization
+    if (window.DocAccess._pendingDocBoxCalls && window.DocAccess._pendingDocBoxCalls.length > 0) {
+        window.DocAccess._pendingDocBoxCalls.forEach(call => {
+            try {
+                window.DocBox[call.fn](...call.args);
+            } catch (e) {
+                console.error('DocBox: Error processing queued call:', call.fn, e);
+            }
+        });
+        window.DocAccess._pendingDocBoxCalls = [];
+    }
+}
+
+// Detect current language from URL parameter or Google Translate
+window.DocAccess.getDetectedLanguage = function () {
+    window.DocAccess._log('getDetectedLanguage() called');
+
+    // Priority 1: URL parameter (explicit user request)
+    const urlParams = new URLSearchParams(window.location.search);
+    const urlLang = urlParams.get('docaccess-set-lang') || urlParams.get('lang');
+    if (urlLang) {
+        window.DocAccess._log('Language from URL parameter:', urlLang);
+        return urlLang;
+    }
+
+    // Priority 2: Google Translate cookie (persisted user preference - most reliable)
+    const cookies = document.cookie.split(';');
+    for (const cookie of cookies) {
+        const [name, value] = cookie.trim().split('=');
+        if (name === 'googtrans' && value) {
+            // Format is /auto/es or /en/es
+            const parts = value.split('/');
+            if (parts.length >= 3 && parts[2]) {
+                window.DocAccess._log('Language from cookie:', parts[2]);
+                return parts[2];
+            }
+        }
+    }
+
+    // Priority 3: Google Translate hash (URL state)
+    const hash = window.location.hash;
+    window.DocAccess._log('URL hash:', hash);
+    if (hash.includes('googtrans')) {
+        const match = hash.match(/googtrans\([^|]+\|([^)]+)\)/);
+        if (match) {
+            window.DocAccess._log('Language from URL hash:', match[1]);
+            return match[1];
+        }
+    }
+
+    // Priority 4: Google Translate dropdown (fallback - only if page is translated and no cookie/hash)
+    // The dropdown can have uninitialized values, so we only use it as a last resort
+    const isPageTranslated = document.documentElement.classList.contains('translated-ltr') ||
+        document.documentElement.classList.contains('translated-rtl');
+    window.DocAccess._log('isPageTranslated:', isPageTranslated, 'html classes:', document.documentElement.className);
+    if (isPageTranslated) {
+        const googleTranslateCombo = document.querySelector('.goog-te-combo');
+        if (googleTranslateCombo && googleTranslateCombo.value && googleTranslateCombo.value !== 'auto') {
+            window.DocAccess._log('Language from Google Translate dropdown (fallback):', googleTranslateCombo.value);
+            return googleTranslateCombo.value;
+        }
+    }
+
+    window.DocAccess._log('No language detected, returning null');
+    return null;
+};
+
+// Clear googtrans cookie when user switches back to English
+// This prevents stale cookies from triggering auto-transcript on future document views
+window.DocAccess.clearGoogTransCookie = function () {
+    // Clear the cookie by setting it to expire in the past
+    // Google Translate sets cookies on multiple paths, so clear all common ones
+    const paths = ['/', window.location.pathname];
+    const domains = [window.location.hostname, '.' + window.location.hostname];
+
+    for (const path of paths) {
+        for (const domain of domains) {
+            document.cookie = `googtrans=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=${path}; domain=${domain}`;
+        }
+        // Also try without domain (current domain only)
+        document.cookie = `googtrans=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=${path}`;
+    }
+    window.DocAccess._log('Cleared googtrans cookie');
+};
+
+// Watch for Google Translate dropdown changes and clear cookie when English is selected
+(function () {
+    let dropdownWatched = false;
+
+    function watchGoogleTranslateDropdown() {
+        if (dropdownWatched) return;
+
+        const combo = document.querySelector('.goog-te-combo');
+        if (combo) {
+            dropdownWatched = true;
+            combo.addEventListener('change', function () {
+                const selectedLang = combo.value;
+                // If English is selected (empty value means original/English, handle variants)
+                if (!selectedLang || selectedLang.startsWith('en')) {
+                    window.DocAccess.clearGoogTransCookie();
+                }
+            });
+            window.DocAccess._log('Watching Google Translate dropdown for English switch');
+        }
+    }
+
+    // Check immediately and periodically for the dropdown
+    watchGoogleTranslateDropdown();
+
+    // Google Translate loads asynchronously, so check periodically
+    let attempts = 0;
+    const maxAttempts = 50; // 5 seconds max
+    const checkInterval = setInterval(function () {
+        attempts++;
+        watchGoogleTranslateDropdown();
+        if (dropdownWatched || attempts >= maxAttempts) {
+            clearInterval(checkInterval);
+        }
+    }, 100);
+})();
+
+// Calculate SHA-256 hash of the link URL
+window.DocAccess.generateSHA256 = async function (message) {
+    // Check cache first
+    if (window.DocAccess.sha256Cache.has(message)) {
+        return window.DocAccess.sha256Cache.get(message);
+    }
+
+    // 1. Convert the message string to a Uint8Array
+    const encoder = new TextEncoder();
+    const data = encoder.encode(message);
+
+    // 2. Compute the SHA-256 hash, which returns a Promise that resolves to an ArrayBuffer
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+
+    // 3. Convert the ArrayBuffer to a byte array
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+
+    // 4. Convert bytes to hex string
+    const hashHex = hashArray
+        .map(byte => byte.toString(16).padStart(2, '0'))
+        .join('');
+
+    // Cache the result
+    window.DocAccess.sha256Cache.set(message, hashHex);
+
+    return hashHex;
+};
+
+// Detect if we're running inside a WYSIWYG editor
+function isInWysiwygEditor() {
+    // First check: Are we in an admin/editor URL context?
+    const isAdminUrl = (
+        (window.location.href.includes('/admin/') && window.location.href.includes('edit')) ||
+        window.location.href.includes('wp-admin') ||
+        window.location.href.includes('/wp-admin/') ||
+        window.location.href.includes('node/') && window.location.href.includes('/edit')
+    );
+
+    // Check for CMS edit-mode URL patterns (e.g., Blackboard/SchoolWires action=edit)
+    const searchParams = new URLSearchParams(window.location.search);
+    const isCmsEditUrl = searchParams.get('action') === 'edit' ||
+        searchParams.get('portletAction') === 'edit';
+
+    // Both action=edit and portletAction=edit is a definitive CMS edit page — disable immediately
+    if (searchParams.get('action') === 'edit' && searchParams.get('portletAction') === 'edit') {
+        return true;
+    }
+
+    // If not in any editor URL context, only skip if body itself is an editor
+    if (!isAdminUrl && !isCmsEditUrl) {
+        // Only skip if the body element itself is a WYSIWYG editor
+        return document.body && (
+            document.body.classList.contains('mce-content-body') ||
+            document.body.classList.contains('cke_editable') ||
+            document.body.getAttribute('contenteditable') === 'true'
+        );
+    }
+
+    // If we are in an editor URL context, check for active editors
+    const wysiwygIndicators = [
+        // Check if body has common editor classes
+        document.body && (
+            document.body.classList.contains('mce-content-body') ||
+            document.body.classList.contains('cke_editable')
+        ),
+        // Check for TinyMCE active editor
+        window.tinymce && window.tinymce.activeEditor,
+        // Check for CKEditor instances
+        window.CKEDITOR && Object.keys(window.CKEDITOR.instances || {}).length > 0,
+        // Check for iframe-based editors (body element is in an iframe)
+        window.frameElement && window.frameElement.classList.contains('cke_wysiwyg_frame'),
+        // Check for Telerik RadEditor / Blackboard CMS inline editor
+        document.querySelector('[contenteditable="true"].reContentArea') !== null,
+        document.querySelector('[contenteditable="true"].reContentAreaToggle') !== null
+    ];
+
+    return wysiwygIndicators.some(indicator => indicator);
+}
+
+// Expose the DocBox API globally immediately (before initialization completes)
+// This allows other scripts (like docbox-overlay.js) to detect that docbox.js is loaded
+// Only set up stubs if DocBox doesn't already exist (prevents reset on duplicate load)
+if (!window.DocBox) {
+    if (!window.DocAccess._pendingDocBoxCalls) {
+        window.DocAccess._pendingDocBoxCalls = [];
+    }
+
+    window.DocBox = {
+        init: function (...args) {
+            // Queue the call for after initialization
+            window.DocAccess._pendingDocBoxCalls.push({ fn: 'init', args: args });
+        },
+        open: function (...args) {
+            // Queue the call for after initialization
+            window.DocAccess._pendingDocBoxCalls.push({ fn: 'open', args: args });
+        },
+        close: function (...args) {
+            // Queue the call for after initialization
+            window.DocAccess._pendingDocBoxCalls.push({ fn: 'close', args: args });
+        }
+    };
+
+    // Also expose under window.DocAccess for better namespacing
+    window.DocAccess.DocBox = window.DocBox;
+}
+
+// Initialize DocBox
+// Check if disabled via config or killswitch element
+// Killswitch: Add <div id="docaccess-disable-this-page"></div> anywhere on the page to disable DocAccess
+if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+    // Skip on localhost — documents can't be downloaded from local environments
+} else if (window.DocAccess.config && window.DocAccess.config.disabled === true) {
+    // Silently skip - disabled via config
+} else if (document.getElementById('docaccess-disable-this-page')) {
+    // Silently skip - disabled via killswitch element on this page
+    window.DocAccess._log('Disabled via killswitch element (#docaccess-disable-this-page)');
+} else if (window.DocAccess.initialized) {
+    // Already initialized - script was loaded multiple times, silently skip
+} else if (isInWysiwygEditor()) {
+    // Don't run in WYSIWYG editors to prevent attributes from being saved to HTML
+    window.DocAccess._log('Skipping initialization - running in WYSIWYG editor');
+} else {
+    // Not disabled and not already initialized
+    window.DocAccess.initialized = true;
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function () {
+            window.setTimeout(initDocBox, 200);
+        });
+    } else {
+        window.setTimeout(initDocBox, 200);
+    }
+} // End of initialization check
+
+async function initDocBox() {
+    // Check if we're on a docaccess domain (including subdomains or localhost)
+    if (window.DocAccess.currentDomain.endsWith('docaccess.com') || window.DocAccess.currentDomain === 'localhost') {
+        window.DocAccess.onDocAccessDomain = true;
+        window.DocAccess.domainDataLoaded = true;
+        window.DocAccess.initializeDocBox();
+        return;
+    }
+
+    // Check for native CivicClerk portal URL pattern: {tenant}.portal.civicclerk.com
+    // These portals use the full portal domain for domain.json lookup
+    // Note: tenant can include dots for subdomains (e.g., devtest.qa.portal.civicclerk.com)
+    const hostname = window.location.hostname.toLowerCase();
+    const portalMatch = hostname.match(/^([a-z0-9.-]+)\.portal\.civicclerk\.com$/);
+    let isNativePortal = false;
+    let civicClerkTenant = null;
+
+    if (portalMatch) {
+        civicClerkTenant = portalMatch[1];
+        isNativePortal = true;
+        // Store for later use by CivicClerk integration
+        window.clerkEmbedProps = window.clerkEmbedProps || {};
+        window.clerkEmbedProps.tenant = civicClerkTenant;
+        window.clerkEmbedProps.isNativePortal = true;
+        window.DocAccess._log('Detected native CivicClerk portal for tenant:', civicClerkTenant);
+    }
+
+    // For all other domains, fetch the manifest
+    try {
+        const domainToFetch = window.DocAccess.currentDomain;
+        const domainJsonUrl = `https://docaccess.com/domains/${domainToFetch}/domain.json`;
+
+        // IndexedDB manifest cache with gzip compression. We ALWAYS fetch
+        // (browser HTTP cache handles ETag/304 revalidation via max-age=15),
+        // so changes propagate in real-time. IndexedDB is purely a
+        // network-failure fallback that avoids bloating localStorage with
+        // large manifests 
+        const _mdb = (() => {
+            let dbp;
+            const open = () => dbp || (dbp = new Promise(r => {
+                try {
+                    const req = indexedDB.open('da', 1);
+                    req.onupgradeneeded = (e) => e.target.result.createObjectStore('m');
+                    req.onsuccess = (e) => r(e.target.result);
+                    req.onerror = () => r(null);
+                } catch (e) { r(null); }
+            }));
+            const canGz = typeof CompressionStream !== 'undefined';
+            return {
+                async get(k) {
+                    const db = await open();
+                    if (!db) return null;
+                    return new Promise(r => {
+                        try {
+                            const req = db.transaction('m', 'readonly').objectStore('m').get(k);
+                            req.onsuccess = async () => {
+                                const entry = req.result;
+                                if (!entry) return r(null);
+                                try {
+                                    if (entry.z) {
+                                        const ds = new Blob([entry.z]).stream().pipeThrough(new DecompressionStream('gzip'));
+                                        r(JSON.parse(await new Response(ds).text()));
+                                    } else {
+                                        r(entry.d);
+                                    }
+                                } catch (e) { r(null); }
+                            };
+                            req.onerror = () => r(null);
+                        } catch (e) { r(null); }
+                    });
+                },
+                async set(k, v) {
+                    const db = await open();
+                    if (!db) return;
+                    try {
+                        const st = db.transaction('m', 'readwrite').objectStore('m');
+                        if (canGz) {
+                            const cs = new Blob([JSON.stringify(v)]).stream().pipeThrough(new CompressionStream('gzip'));
+                            st.put({ z: await new Response(cs).arrayBuffer() }, k);
+                        } else {
+                            st.put({ d: v }, k);
+                        }
+                    } catch (e) { }
+                },
+                async del(k) {
+                    const db = await open();
+                    if (!db) return;
+                    try { db.transaction('m', 'readwrite').objectStore('m').delete(k); } catch (e) { }
+                }
+            };
+        })();
+
+        let data;
+        const response = await fetch(domainJsonUrl).catch(() => null);
+
+        if (response && response.status === 403) {
+            _mdb.del(domainToFetch);
+            if (isNativePortal) {
+                window.DocAccess._log('Native CivicClerk portal not registered - features disabled');
+                return;
+            }
+            if (window.DocAccess.overlayScriptActive === true) {
+                alert(`Domain ${window.DocAccess.currentDomain} not added to DocAccess`);
+            }
+            throw new Error('Access Denied');
+        }
+
+        if (response && response.ok) {
+            data = await response.json();
+            _mdb.set(domainToFetch, data);
+        } else {
+            data = await _mdb.get(domainToFetch);
+            if (!data) throw new Error(response ? `HTTP error! status: ${response.status}` : 'Network error');
+        }
+
+        // If domain is marked as compromised, silently disable DocAccess
+        if (data.compromised) {
+            window.DocAccess._log('Domain is marked as compromised - disabled');
+            return;
+        }
+
+        // Extract domain and aliases if present in new format
+        if (data.domain) {
+            window.DocAccess.primaryDomain = data.domain;
+            window.DocAccess.domainAliases = data.aliases || [];
+            // Merge default excluded paths with domain-specific ones
+            const domainExcludedPaths = data.excluded_paths || [];
+            window.DocAccess.excludedPaths = [...window.DocAccess.defaultExcludedPaths, ...domainExcludedPaths];
+            window.DocAccess.includedPaths = data.included_paths || [];
+
+            // Store SB707 config if present
+            if (data.sb707) {
+                window.DocAccess.sb707Config = data.sb707;
+            }
+
+            // Store CivicClerk tenant if detected (for embedded widgets)
+            if (data.civicclerk_tenant) {
+                window.DocAccess.civicclerkTenant = data.civicclerk_tenant;
+            }
+
+            // Store default transcript view setting
+            if (data.default_transcript_view) {
+                window.DocAccess.defaultTranscriptView = true;
+            }
+
+            // Store open in new tab setting
+            if (data.open_in_new_tab) {
+                window.DocAccess.openInNewTab = true;
+            }
+
+            // Store translation enabled setting (default is true/enabled)
+            if (data.translation_enabled === false) {
+                window.DocAccess.translationEnabled = false;
+            }
+
+            // Store version check disabled setting
+            if (data.version_check_disabled === true) {
+                window.DocAccess.versionCheckDisabled = true;
+            }
+
+            // Store featured languages from manifest (custom language selections)
+            if (Array.isArray(data.featured_languages) && data.featured_languages.length > 0) {
+                window.DocAccess.featuredLanguages = data.featured_languages;
+            }
+
+            // Remove non-hash keys from data to get just the URL hashes
+            const { domain, aliases, excluded_paths, included_paths, sb707, civicclerk_tenant, docbox_enabled, link_processing_disabled, default_transcript_view, open_in_new_tab, translation_enabled, version_check_disabled, docbox_installed, featured_languages, ...urlHashes } = data;
+            window.DocAccess.domainDocumentLinkData = urlHashes;
+
+            // Check for hard shutdown (link_processing_disabled)
+            // When true, completely stop the script unless in overlay/bookmarklet mode
+            if (link_processing_disabled === true) {
+                window.DocAccess.linkProcessingDisabled = true;
+                if (window.DocAccess.overlayScriptActive !== true) {
+                    window.DocAccess._log('Link processing is disabled for this customer (hard shutdown)');
+                    return;
+                }
+                window.DocAccess._log('Link processing is disabled, but overlay mode is active (demo)');
+            }
+
+            // Check if viewer is disabled (docbox_enabled = false)
+            // When false, still process/discover links but don't activate the viewer for clicks
+            // Exception: if overlay is active, allow viewer for demos
+            if (docbox_enabled === false && window.DocAccess.overlayScriptActive !== true) {
+                window.DocAccess.viewerDisabled = true;
+                window.DocAccess._log('Viewer is paused for this customer (still processing links)');
+            } else if (docbox_enabled === false) {
+                window.DocAccess._log('Viewer is paused, but overlay mode is active (demo)');
+            }
+        } else {
+            // Old format - data is just URL hashes
+            window.DocAccess.domainDocumentLinkData = data;
+            // Keep default excluded paths even in old format
+            window.DocAccess.excludedPaths = [...window.DocAccess.defaultExcludedPaths];
+            window.DocAccess.includedPaths = [];
+        }
+
+        window.DocAccess.domainDataLoaded = true;
+
+        // For native CivicClerk portals, now that domain is verified, load the integration
+        if (isNativePortal && civicClerkTenant && typeof window.DocAccess.loadCivicClerkIntegration === 'function') {
+            window.DocAccess._log('Native CivicClerk portal registered, enabling features');
+            window.DocAccess.loadCivicClerkIntegration();
+        }
+
+        // Load SB707 Public Meetings block if configured
+        if (window.DocAccess.sb707Config && window.DocAccess.sb707Config.enabled) {
+            loadSB707Block();
+        }
+
+        // Check if initializeDocBox has already been called
+        if (!window.DocAccess.initializeDocBoxCalled) {
+            // First time - call initializeDocBox (which will call initPdfLinks internally)
+            window.DocAccess.initializeDocBox();
+        } else {
+            // initializeDocBox was already called (from DOMContentLoaded)
+            // Now that manifest is loaded, reprocess all links
+            const reprocessLinks = () => {
+                if (!window.DocAccess.isBatchProcessing) {
+                    window.DocBox.init();
+                } else {
+                    // Still processing, check again soon
+                    setTimeout(reprocessLinks, 100);
+                }
+            };
+            reprocessLinks();
+        }
+
+    } catch (error) {
+        // Log as debug - this is expected for domains not registered with DocAccess
+        window.DocAccess._log("Domain not registered with DocAccess.", error.message);
+    }
+}
+
+// Function to load SB707 Public Meetings block
+function loadSB707Block() {
+    // Only load on homepage
+    const path = window.location.pathname;
+    if (path !== '/' && path !== '' && path !== '/index.html' && path !== '/index.php') {
+        return;
+    }
+
+    // Create script tag to load SB707 block
+    const script = document.createElement('script');
+
+    // Use same domain as docbox.js was loaded from
+    let scriptSrc = '';
+    const currentScript = document.currentScript || (function () {
+        const scripts = document.getElementsByTagName('script');
+        for (let i = 0; i < scripts.length; i++) {
+            if (scripts[i].src && scripts[i].src.match(/docbox\.js(\?.*)?$/)) {
+                return scripts[i];
+            }
+        }
+        return null;
+    })();
+
+    if (currentScript && currentScript.src) {
+        const url = new URL(currentScript.src);
+        scriptSrc = url.origin + '/docbox-sb707.js';
+    } else {
+        // Default to docaccess.com
+        scriptSrc = 'https://docaccess.com/docbox-sb707.js';
+    }
+
+    script.src = scriptSrc;
+    script.async = true;
+    script.onload = function () {
+        window.DocAccess._log('SB707 Public Meetings block script loaded');
+        // Initialize with config
+        if (window.DocAccess.SB707Block && window.DocAccess.sb707Config) {
+            window.DocAccess.SB707Block.init(window.DocAccess.sb707Config);
+        }
+    };
+    script.onerror = function () {
+        console.error('DocAccess: Failed to load SB707 Public Meetings block');
+    };
+
+    document.head.appendChild(script);
+}
